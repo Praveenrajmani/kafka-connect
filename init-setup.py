@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Kafka Connect Iceberg Sink Initialization Script
+Kafka Connect Iceberg Sink Initialization Script - Dual Cluster Setup
 
 This script:
 1. Creates the Kafka control topic (required for Iceberg commit coordination)
-2. Creates the warehouse and namespace in MinIO AIStor Tables using PyIceberg
-3. Deploys the Iceberg Sink connector
+2. Creates a test bucket on the source MinIO cluster (to generate logs)
+3. Creates the warehouse and namespace in Destination MinIO AIStor Tables
+4. Deploys the Iceberg Sink connector pointing to destination cluster
 
-Uses PyIceberg REST catalog for AIStor Tables API.
+Architecture:
+  Source MinIO (4-node) -> Kafka -> Kafka Connect -> Iceberg -> Destination MinIO (4-node)
 """
 
 import hashlib
@@ -20,17 +22,28 @@ import boto3
 import requests
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
+from botocore.client import Config
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError
 
 # =============================================================================
 # Configuration from environment
 # =============================================================================
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
-ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+# Source MinIO cluster (generates logs)
+MINIO_SOURCE_ENDPOINT = os.getenv("MINIO_SOURCE_ENDPOINT", "http://nginx-source:9000")
+SOURCE_ACCESS_KEY = os.getenv("MINIO_SOURCE_ACCESS_KEY", "minioadmin")
+SOURCE_SECRET_KEY = os.getenv("MINIO_SOURCE_SECRET_KEY", "minioadmin")
+
+# Destination MinIO cluster (Iceberg tables)
+MINIO_DEST_ENDPOINT = os.getenv("MINIO_DEST_ENDPOINT", "http://nginx-dest:9000")
+DEST_ACCESS_KEY = os.getenv("MINIO_DEST_ACCESS_KEY", "minioadmin")
+DEST_SECRET_KEY = os.getenv("MINIO_DEST_SECRET_KEY", "minioadmin")
+
+# Kafka
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 KAFKA_CONNECT_URL = os.getenv("KAFKA_CONNECT_URL", "http://kafka-connect:8083")
+
+# Iceberg configuration
 WAREHOUSE_NAME = os.getenv("WAREHOUSE_NAME", "kafkawarehouse")
 NAMESPACE_NAME = os.getenv("NAMESPACE_NAME", "streaming")
 TABLE_NAME = os.getenv("TABLE_NAME", "events")
@@ -58,17 +71,17 @@ def print_info(msg: str):
     print(f"ℹ {msg}")
 
 
-def sigv4_sign(method: str, url: str, body: str, headers: dict) -> dict:
+def sigv4_sign(method: str, url: str, body: str, headers: dict, endpoint: str, access_key: str, secret_key: str) -> dict:
     """Sign a request using AWS SigV4."""
     session = boto3.Session(
-        aws_access_key_id=ACCESS_KEY,
-        aws_secret_access_key=SECRET_KEY,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
         region_name="us-east-1",
     )
     payload_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
     headers["x-amz-content-sha256"] = payload_hash
-    headers["Host"] = MINIO_ENDPOINT.replace("http://", "").replace("https://", "")
+    headers["Host"] = endpoint.replace("http://", "").replace("https://", "")
 
     request = AWSRequest(
         method=method,
@@ -152,35 +165,96 @@ def create_control_topic():
 
 
 # =============================================================================
-# Step 2: Create Warehouse and Namespace using REST API with SigV4
+# Step 2: Setup Source MinIO (create test bucket to generate logs)
 # =============================================================================
-def setup_aistor_tables():
-    """Create warehouse and namespace in MinIO AIStor Tables using REST API."""
-    print_step(2, "Setting Up MinIO AIStor Tables (REST API with SigV4)")
+def setup_source_minio():
+    """Create a test bucket on source MinIO to generate API logs."""
+    print_step(2, "Setting Up Source MinIO Cluster (Log Generator)")
 
-    # Wait for MinIO to be ready
-    print_info(f"Connecting to MinIO at {MINIO_ENDPOINT}...")
+    # Wait for source MinIO to be ready
+    print_info(f"Connecting to Source MinIO at {MINIO_SOURCE_ENDPOINT}...")
     max_retries = 30
 
     for i in range(max_retries):
         try:
-            resp = requests.get(f"{MINIO_ENDPOINT}/minio/health/live", timeout=5)
+            resp = requests.get(f"{MINIO_SOURCE_ENDPOINT}/minio/health/live", timeout=5)
             if resp.status_code == 200:
-                print_success("MinIO is ready")
+                print_success("Source MinIO is ready")
                 break
         except Exception:
             pass
 
         if i < max_retries - 1:
-            print_info(f"Waiting for MinIO... ({i+1}/{max_retries})")
+            print_info(f"Waiting for Source MinIO... ({i+1}/{max_retries})")
             time.sleep(2)
         else:
-            print_error("MinIO is not responding")
+            print_error("Source MinIO is not responding")
+            return False
+
+    # Create S3 client for source cluster
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=MINIO_SOURCE_ENDPOINT,
+        aws_access_key_id=SOURCE_ACCESS_KEY,
+        aws_secret_access_key=SOURCE_SECRET_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="us-east-1",
+    )
+
+    # Create a test bucket
+    test_bucket = "test-logs-bucket"
+    try:
+        s3_client.create_bucket(Bucket=test_bucket)
+        print_success(f"Created test bucket: {test_bucket}")
+    except s3_client.exceptions.BucketAlreadyOwnedByYou:
+        print_info(f"Test bucket already exists: {test_bucket}")
+    except Exception as e:
+        print_info(f"Bucket creation note: {e}")
+
+    # Upload a test object to generate some logs
+    try:
+        s3_client.put_object(
+            Bucket=test_bucket,
+            Key="test-object.txt",
+            Body=b"This is a test object to generate MinIO API logs",
+        )
+        print_success("Uploaded test object to generate API logs")
+    except Exception as e:
+        print_info(f"Test object upload note: {e}")
+
+    return True
+
+
+# =============================================================================
+# Step 3: Create Warehouse and Namespace on Destination MinIO
+# =============================================================================
+def setup_dest_aistor_tables():
+    """Create warehouse and namespace in Destination MinIO AIStor Tables."""
+    print_step(3, "Setting Up Destination MinIO AIStor Tables (Iceberg)")
+
+    # Wait for destination MinIO to be ready
+    print_info(f"Connecting to Destination MinIO at {MINIO_DEST_ENDPOINT}...")
+    max_retries = 30
+
+    for i in range(max_retries):
+        try:
+            resp = requests.get(f"{MINIO_DEST_ENDPOINT}/minio/health/live", timeout=5)
+            if resp.status_code == 200:
+                print_success("Destination MinIO is ready")
+                break
+        except Exception:
+            pass
+
+        if i < max_retries - 1:
+            print_info(f"Waiting for Destination MinIO... ({i+1}/{max_retries})")
+            time.sleep(2)
+        else:
+            print_error("Destination MinIO is not responding")
             return False
 
     # Create warehouse using REST API with SigV4 signing
     print_info(f"Creating warehouse: {WAREHOUSE_NAME}")
-    warehouse_url = f"{MINIO_ENDPOINT}/_iceberg/v1/warehouses"
+    warehouse_url = f"{MINIO_DEST_ENDPOINT}/_iceberg/v1/warehouses"
     payload = json.dumps({"name": WAREHOUSE_NAME})
     headers_to_sign = {
         "content-type": "application/json",
@@ -188,7 +262,10 @@ def setup_aistor_tables():
     }
 
     try:
-        signed_headers = sigv4_sign("POST", warehouse_url, payload, headers_to_sign)
+        signed_headers = sigv4_sign(
+            "POST", warehouse_url, payload, headers_to_sign,
+            MINIO_DEST_ENDPOINT, DEST_ACCESS_KEY, DEST_SECRET_KEY
+        )
         resp = requests.post(warehouse_url, data=payload, headers=signed_headers, timeout=30)
 
         if resp.status_code == 200:
@@ -204,7 +281,7 @@ def setup_aistor_tables():
 
     # Create namespace using REST API
     print_info(f"Creating namespace: {NAMESPACE_NAME}")
-    namespace_url = f"{MINIO_ENDPOINT}/_iceberg/v1/{WAREHOUSE_NAME}/namespaces"
+    namespace_url = f"{MINIO_DEST_ENDPOINT}/_iceberg/v1/{WAREHOUSE_NAME}/namespaces"
     payload = json.dumps({"namespace": [NAMESPACE_NAME]})
     headers_to_sign = {
         "content-type": "application/json",
@@ -212,7 +289,10 @@ def setup_aistor_tables():
     }
 
     try:
-        signed_headers = sigv4_sign("POST", namespace_url, payload, headers_to_sign)
+        signed_headers = sigv4_sign(
+            "POST", namespace_url, payload, headers_to_sign,
+            MINIO_DEST_ENDPOINT, DEST_ACCESS_KEY, DEST_SECRET_KEY
+        )
         resp = requests.post(namespace_url, data=payload, headers=signed_headers, timeout=30)
 
         if resp.status_code == 200:
@@ -228,11 +308,11 @@ def setup_aistor_tables():
 
 
 # =============================================================================
-# Step 3: Deploy Iceberg Sink Connector
+# Step 4: Deploy Iceberg Sink Connector (pointing to Destination MinIO)
 # =============================================================================
 def deploy_connector():
     """Deploy the Iceberg Sink connector to Kafka Connect."""
-    print_step(3, "Deploying Iceberg Sink Connector")
+    print_step(4, "Deploying Iceberg Sink Connector")
 
     connector_name = "iceberg-sink"
 
@@ -264,7 +344,7 @@ def deploy_connector():
         requests.delete(f"{KAFKA_CONNECT_URL}/connectors/{connector_name}")
         time.sleep(2)
 
-    # Connector configuration
+    # Connector configuration - pointing to DESTINATION MinIO cluster
     connector_config = {
         "name": connector_name,
         "config": {
@@ -275,18 +355,18 @@ def deploy_connector():
             "iceberg.tables": f"{NAMESPACE_NAME}.{TABLE_NAME}",
             "iceberg.tables.auto-create-enabled": "true",
             "iceberg.tables.evolve-schema-enabled": "true",
-            # Catalog settings (REST catalog pointing to MinIO AIStor)
+            # Catalog settings (REST catalog pointing to DESTINATION MinIO AIStor)
             "iceberg.catalog.type": "rest",
-            "iceberg.catalog.uri": "http://minio:9000/_iceberg",
+            "iceberg.catalog.uri": "http://nginx-dest:9000/_iceberg",
             "iceberg.catalog.warehouse": WAREHOUSE_NAME,
             # SigV4 authentication
             "iceberg.catalog.rest.sigv4-enabled": "true",
             "iceberg.catalog.rest.signing-name": "s3tables",
             "iceberg.catalog.rest.signing-region": "us-east-1",
-            # S3 settings for data access
-            "iceberg.catalog.s3.access-key-id": ACCESS_KEY,
-            "iceberg.catalog.s3.secret-access-key": SECRET_KEY,
-            "iceberg.catalog.s3.endpoint": "http://minio:9000",
+            # S3 settings for data access (DESTINATION MinIO)
+            "iceberg.catalog.s3.access-key-id": DEST_ACCESS_KEY,
+            "iceberg.catalog.s3.secret-access-key": DEST_SECRET_KEY,
+            "iceberg.catalog.s3.endpoint": "http://nginx-dest:9000",
             "iceberg.catalog.s3.path-style-access": "true",
             # Control topic for commit coordination
             "iceberg.control.topic": "control-iceberg",
@@ -336,54 +416,76 @@ def deploy_connector():
 
 
 # =============================================================================
-# Step 4: Print Summary and Test Commands
+# Step 5: Print Summary and Test Commands
 # =============================================================================
 def print_summary():
     """Print summary and helpful commands."""
-    print_step(4, "Setup Complete!")
+    print_step(5, "Setup Complete!")
 
     print("""
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    KAFKA CONNECT ICEBERG SINK READY                      │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Services:                                                               │
-│    • Kafka:         localhost:9092                                       │
-│    • Kafka Connect: http://localhost:8083                                │
-│    • MinIO Console: http://localhost:9001 (minioadmin/minioadmin)        │
-│    • MinIO API:     http://localhost:9000                                │
-│                                                                          │
-│  Configuration:                                                          │
-│    • Warehouse:     kafkawarehouse                                       │
-│    • Namespace:     streaming                                            │
-│    • Table:         events                                               │
-│    • Data Topic:    events                                               │
-│    • Control Topic: control-iceberg                                      │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│           KAFKA CONNECT ICEBERG SINK - DUAL CLUSTER SETUP READY              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  SOURCE CLUSTER (Kafka Log Targets - PR #2463):                              │
+│    • MinIO API:     http://localhost:9000   (via nginx-source)               │
+│    • MinIO Console: http://localhost:9001   (minioadmin/minioadmin)          │
+│    • Sends API logs to Kafka topic: events                                   │
+│                                                                              │
+│  DESTINATION CLUSTER (Iceberg Tables):                                       │
+│    • MinIO API:     http://localhost:9010   (via nginx-dest)                 │
+│    • MinIO Console: http://localhost:9011   (minioadmin/minioadmin)          │
+│    • Stores Iceberg tables from Kafka                                        │
+│                                                                              │
+│  KAFKA & CONNECT:                                                            │
+│    • Kafka:         localhost:9092                                           │
+│    • Kafka Connect: http://localhost:8083                                    │
+│                                                                              │
+│  ICEBERG CONFIGURATION:                                                      │
+│    • Warehouse:     kafkawarehouse                                           │
+│    • Namespace:     streaming                                                │
+│    • Table:         events                                                   │
+│    • Data Topic:    events                                                   │
+│    • Control Topic: control-iceberg                                          │
+│                                                                              │
+│  DATA FLOW:                                                                  │
+│    Source MinIO -> Kafka -> Kafka Connect -> Iceberg -> Destination MinIO    │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
 
 Test Commands:
-─────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────────────────
 
-1. Produce test messages:
+1. Generate logs by interacting with SOURCE MinIO:
 
-   echo '{"event_id": "evt-001", "event_type": "click", "user_id": 123, "timestamp": "2024-12-24T10:00:00Z"}' | \\
-     docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic events
+   # List buckets (generates API log)
+   aws --endpoint-url http://localhost:9000 s3 ls
+
+   # Upload a file (generates more logs)
+   echo "test data" | aws --endpoint-url http://localhost:9000 s3 cp - s3://test-logs-bucket/test.txt
 
 2. Check connector status:
 
    curl -s http://localhost:8083/connectors/iceberg-sink/status | jq
 
-3. List Kafka topics:
+3. View Kafka topics and messages:
 
+   # List topics
    docker exec kafka kafka-topics --bootstrap-server localhost:29092 --list
 
-4. View MinIO Console:
+   # View events topic (logs from source MinIO)
+   docker exec kafka kafka-console-consumer --bootstrap-server localhost:29092 --topic events --from-beginning --max-messages 5
 
-   Open http://localhost:9001 in your browser
+4. View DESTINATION MinIO Console (Iceberg tables):
+
+   Open http://localhost:9011 in your browser
    Navigate to: kafkawarehouse/streaming/events/
 
-5. Query table with PyIceberg (requires AWS creds in env):
+5. View SOURCE MinIO Console (Log generator):
+
+   Open http://localhost:9001 in your browser
+
+6. Query Iceberg table with PyIceberg:
 
    ./kafka-connect-iceberg-sink.sh query
 
@@ -395,7 +497,7 @@ Test Commands:
 # =============================================================================
 def main():
     print("\n" + "=" * 60)
-    print("  Kafka Connect Iceberg Sink Initialization")
+    print("  Kafka Connect Iceberg Sink - Dual Cluster Initialization")
     print("=" * 60)
 
     # Run setup steps
@@ -403,12 +505,16 @@ def main():
         print_error("Failed at Step 1: Create control topic")
         sys.exit(1)
 
-    if not setup_aistor_tables():
-        print_error("Failed at Step 2: Setup AIStor Tables")
+    if not setup_source_minio():
+        print_error("Failed at Step 2: Setup source MinIO")
+        sys.exit(1)
+
+    if not setup_dest_aistor_tables():
+        print_error("Failed at Step 3: Setup destination AIStor Tables")
         sys.exit(1)
 
     if not deploy_connector():
-        print_error("Failed at Step 3: Deploy connector")
+        print_error("Failed at Step 4: Deploy connector")
         sys.exit(1)
 
     print_summary()

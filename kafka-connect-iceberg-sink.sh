@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# Kafka Connect Iceberg Sink to MinIO AIStor
-# One-click setup for streaming Kafka data to Iceberg tables
+# Kafka Connect Iceberg Sink - Dual Cluster Setup
+# Source MinIO (Kafka Log Targets) -> Kafka -> Iceberg -> Destination MinIO (Tables)
 #
 
 set -e
@@ -20,10 +20,10 @@ PROJECT_ROOT="$SCRIPT_DIR"
 print_banner() {
     echo -e "${CYAN}"
     cat << 'EOF'
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║     Kafka Connect Iceberg Sink → MinIO AIStor                 ║
-    ║     Stream data from Kafka to Iceberg tables                  ║
-    ╚═══════════════════════════════════════════════════════════════╝
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║     Kafka Connect Iceberg Sink - Dual Cluster Setup                  ║
+    ║     Source MinIO -> Kafka -> Iceberg -> Destination MinIO            ║
+    ╚══════════════════════════════════════════════════════════════════════╝
 EOF
     echo -e "${NC}"
 }
@@ -44,7 +44,7 @@ print_msg() {
 
 usage() {
     cat << EOF
-Kafka Connect Iceberg Sink to MinIO AIStor
+Kafka Connect Iceberg Sink - Dual Cluster Setup
 
 USAGE:
   $0 [command] [options]
@@ -54,13 +54,31 @@ COMMANDS:
   stop            Stop all services
   status          Show status of all services
   logs            Show logs (use -f for follow)
-  produce         Produce sample messages to Kafka
-  query           Query the Iceberg table
+  generate-logs   Generate API logs by interacting with source MinIO
+  query           Query the Iceberg table on destination MinIO
   restart         Restart all services
   clean           Stop and remove all data
 
 OPTIONS:
   -h, --help      Show this help message
+
+ARCHITECTURE:
+  ┌─────────────────────┐     ┌─────────────────────┐
+  │   SOURCE CLUSTER    │     │  DESTINATION CLUSTER │
+  │   (4-node MinIO)    │     │   (4-node MinIO)     │
+  │   Kafka Log Targets │     │   Iceberg Tables     │
+  │   localhost:9000/01 │     │   localhost:9010/11  │
+  └──────────┬──────────┘     └──────────▲───────────┘
+             │                           │
+             ▼                           │
+  ┌──────────────────────────────────────┴───────────┐
+  │                    KAFKA                          │
+  │              localhost:9092                       │
+  │                     │                             │
+  │              Kafka Connect                        │
+  │            localhost:8083                         │
+  │           (Iceberg Sink)                          │
+  └───────────────────────────────────────────────────┘
 
 EXAMPLES:
   # Start everything
@@ -69,13 +87,13 @@ EXAMPLES:
   # Check status
   $0 status
 
-  # Produce test messages
-  $0 produce
+  # Generate logs on source MinIO
+  $0 generate-logs
 
   # View logs
   $0 logs -f
 
-  # Query Iceberg table
+  # Query Iceberg table on destination
   $0 query
 
   # Stop services
@@ -88,10 +106,10 @@ EOF
     exit 0
 }
 
-# Load MinIO license from parent .env if available
+# Load config from .env
 load_config() {
     if [ -f "${PROJECT_ROOT}/.env" ]; then
-        print_msg "$YELLOW" "Loading MinIO license from ${PROJECT_ROOT}/.env..."
+        print_msg "$YELLOW" "Loading configuration from ${PROJECT_ROOT}/.env..."
         set -a
         source "${PROJECT_ROOT}/.env"
         set +a
@@ -100,7 +118,7 @@ load_config() {
     # Check if license is set
     if [ -z "$MINIO_LICENSE" ]; then
         print_msg "$RED" "Error: MINIO_LICENSE not set"
-        print_msg "$YELLOW" "Please set MINIO_LICENSE in ${PROJECT_ROOT}/.env or export it"
+        print_msg "$YELLOW" "Please set MINIO_LICENSE in ${PROJECT_ROOT}/.env"
         exit 1
     fi
 }
@@ -108,8 +126,9 @@ load_config() {
 # Download Iceberg Kafka Connect plugin if not present
 download_plugin() {
     local plugin_dir="$SCRIPT_DIR/plugins/iceberg-kafka-connect"
-    local plugin_zip="iceberg-kafka-connect-runtime-0.6.19.zip"
-    local download_url="https://github.com/databricks/iceberg-kafka-connect/releases/download/v0.6.19/${plugin_zip}"
+    local plugin_version="${ICEBERG_CONNECTOR_VERSION:-0.6.19}"
+    local plugin_zip="iceberg-kafka-connect-runtime-${plugin_version}.zip"
+    local download_url="https://github.com/databricks/iceberg-kafka-connect/releases/download/v${plugin_version}/${plugin_zip}"
 
     if [ -d "$plugin_dir" ] && [ "$(ls -A $plugin_dir 2>/dev/null)" ]; then
         print_msg "$GREEN" "✓ Iceberg Kafka Connect plugin already installed"
@@ -145,30 +164,83 @@ start_services() {
     load_config
     download_plugin
 
-    print_header "Starting Services"
+    print_header "Starting Dual Cluster Setup"
 
     cd "$SCRIPT_DIR"
 
     # Export for docker-compose
     export MINIO_LICENSE
-    export MINIO_TEST_IMAGE="${MINIO_TEST_IMAGE:-quay.io/minio/aistor/minio:log-targets}"
+    export MINIO_SOURCE_IMAGE
+    export MINIO_DEST_IMAGE
+    export MINIO_ROOT_USER
+    export MINIO_ROOT_PASSWORD
+    export KAFKA_IMAGE
+    export KAFKA_CONNECT_IMAGE
 
-    print_msg "$YELLOW" "Starting Kafka, Kafka Connect, and MinIO..."
-    docker compose up -d kafka minio
+    print_msg "$YELLOW" "Starting Source MinIO cluster (4 nodes)..."
+    docker compose up -d minio-src-1 minio-src-2 minio-src-3 minio-src-4
 
-    print_msg "$YELLOW" "Waiting for Kafka to be ready..."
+    print_msg "$YELLOW" "Starting Destination MinIO cluster (4 nodes)..."
+    docker compose up -d minio-dst-1 minio-dst-2 minio-dst-3 minio-dst-4
+
+    print_msg "$YELLOW" "Starting Kafka..."
+    docker compose up -d kafka
+
+    print_msg "$YELLOW" "Waiting for Source MinIO cluster to be healthy..."
+    for i in {1..60}; do
+        healthy=0
+        for node in minio-src-1 minio-src-2 minio-src-3 minio-src-4; do
+            if docker exec $node curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+                ((healthy++))
+            fi
+        done
+        if [ $healthy -eq 4 ]; then
+            print_msg "$GREEN" "✓ Source MinIO cluster is healthy (4/4 nodes)"
+            break
+        fi
+        if [ $i -eq 60 ]; then
+            print_msg "$RED" "Timeout waiting for Source MinIO cluster"
+            exit 1
+        fi
+        sleep 2
+    done
+
+    print_msg "$YELLOW" "Waiting for Destination MinIO cluster to be healthy..."
+    for i in {1..60}; do
+        healthy=0
+        for node in minio-dst-1 minio-dst-2 minio-dst-3 minio-dst-4; do
+            if docker exec $node curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+                ((healthy++))
+            fi
+        done
+        if [ $healthy -eq 4 ]; then
+            print_msg "$GREEN" "✓ Destination MinIO cluster is healthy (4/4 nodes)"
+            break
+        fi
+        if [ $i -eq 60 ]; then
+            print_msg "$RED" "Timeout waiting for Destination MinIO cluster"
+            exit 1
+        fi
+        sleep 2
+    done
+
+    print_msg "$YELLOW" "Starting Nginx load balancers..."
+    docker compose up -d nginx-source nginx-dest
+
+    print_msg "$YELLOW" "Waiting for Nginx proxies to be ready..."
     for i in {1..30}; do
-        if docker compose exec -T kafka kafka-broker-api-versions --bootstrap-server localhost:29092 >/dev/null 2>&1; then
-            print_msg "$GREEN" "✓ Kafka is ready"
+        if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1 && \
+           curl -sf http://localhost:9010/minio/health/live >/dev/null 2>&1; then
+            print_msg "$GREEN" "✓ Nginx proxies are ready"
             break
         fi
         sleep 2
     done
 
-    print_msg "$YELLOW" "Waiting for MinIO to be ready..."
+    print_msg "$YELLOW" "Waiting for Kafka to be ready..."
     for i in {1..30}; do
-        if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
-            print_msg "$GREEN" "✓ MinIO is ready"
+        if docker compose exec -T kafka kafka-broker-api-versions --bootstrap-server localhost:29092 >/dev/null 2>&1; then
+            print_msg "$GREEN" "✓ Kafka is ready"
             break
         fi
         sleep 2
@@ -193,30 +265,42 @@ start_services() {
 
     echo -e "${GREEN}"
     cat << 'EOF'
-    ┌─────────────────────────────────────────────────────────────────┐
-    │                    SERVICES READY                               │
-    ├─────────────────────────────────────────────────────────────────┤
-    │                                                                 │
-    │  Kafka:              localhost:9092                             │
-    │  Kafka Connect:      http://localhost:8083                      │
-    │  MinIO Console:      http://localhost:9001                      │
-    │                      (user: minioadmin / pass: minioadmin)      │
-    │  MinIO API:          http://localhost:9000                      │
-    │                                                                 │
-    │  Connector:          iceberg-sink                               │
-    │  Data Topic:         events                                     │
-    │  Iceberg Table:      kafkawarehouse.streaming.events            │
-    │                                                                 │
-    └─────────────────────────────────────────────────────────────────┘
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │                    DUAL CLUSTER SETUP READY                              │
+    ├──────────────────────────────────────────────────────────────────────────┤
+    │                                                                          │
+    │  SOURCE CLUSTER (Kafka Log Targets):                                     │
+    │    • MinIO API:     http://localhost:9000   (via nginx-source)           │
+    │    • MinIO Console: http://localhost:9001   (minioadmin/minioadmin)      │
+    │    • 4 distributed nodes with Kafka log targets enabled                  │
+    │                                                                          │
+    │  DESTINATION CLUSTER (Iceberg Tables):                                   │
+    │    • MinIO API:     http://localhost:9010   (via nginx-dest)             │
+    │    • MinIO Console: http://localhost:9011   (minioadmin/minioadmin)      │
+    │    • 4 distributed nodes with Iceberg REST catalog                       │
+    │                                                                          │
+    │  KAFKA & CONNECT:                                                        │
+    │    • Kafka:         localhost:9092                                       │
+    │    • Kafka Connect: http://localhost:8083                                │
+    │                                                                          │
+    │  ICEBERG CONFIGURATION:                                                  │
+    │    • Warehouse:     kafkawarehouse                                       │
+    │    • Namespace:     streaming                                            │
+    │    • Table:         events                                               │
+    │                                                                          │
+    │  DATA FLOW:                                                              │
+    │    Source MinIO API logs -> Kafka -> Iceberg -> Destination MinIO        │
+    │                                                                          │
+    └──────────────────────────────────────────────────────────────────────────┘
 EOF
     echo -e "${NC}"
 
     print_msg "$CYAN" "Quick commands:"
-    echo "  $0 produce   - Send test messages"
-    echo "  $0 status    - Check service status"
-    echo "  $0 logs -f   - View logs"
-    echo "  $0 query     - Query Iceberg table"
-    echo "  $0 stop      - Stop all services"
+    echo "  $0 generate-logs  - Generate API logs on source MinIO"
+    echo "  $0 status         - Check service status"
+    echo "  $0 logs -f        - View logs"
+    echo "  $0 query          - Query Iceberg table on destination"
+    echo "  $0 stop           - Stop all services"
 }
 
 # Stop services
@@ -244,6 +328,39 @@ show_status() {
     docker compose ps
 
     echo ""
+    echo -e "${YELLOW}Source MinIO Cluster Health:${NC}"
+    for node in minio-src-1 minio-src-2 minio-src-3 minio-src-4; do
+        if docker exec $node curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+            echo -e "  ${GREEN}✓ $node: healthy${NC}"
+        else
+            echo -e "  ${RED}✗ $node: unhealthy${NC}"
+        fi
+    done
+
+    echo ""
+    echo -e "${YELLOW}Destination MinIO Cluster Health:${NC}"
+    for node in minio-dst-1 minio-dst-2 minio-dst-3 minio-dst-4; do
+        if docker exec $node curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+            echo -e "  ${GREEN}✓ $node: healthy${NC}"
+        else
+            echo -e "  ${RED}✗ $node: unhealthy${NC}"
+        fi
+    done
+
+    echo ""
+    echo -e "${YELLOW}Nginx Load Balancers:${NC}"
+    if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓ nginx-source (localhost:9000/9001): healthy${NC}"
+    else
+        echo -e "  ${RED}✗ nginx-source: unhealthy${NC}"
+    fi
+    if curl -sf http://localhost:9010/minio/health/live >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓ nginx-dest (localhost:9010/9011): healthy${NC}"
+    else
+        echo -e "  ${RED}✗ nginx-dest: unhealthy${NC}"
+    fi
+
+    echo ""
     echo -e "${YELLOW}Kafka Connect Connectors:${NC}"
     if curl -sf http://localhost:8083/connectors >/dev/null 2>&1; then
         curl -s http://localhost:8083/connectors | jq -r '.[]' 2>/dev/null | while read connector; do
@@ -269,40 +386,58 @@ show_logs() {
     docker compose logs "$@"
 }
 
-# Produce sample messages
-produce_messages() {
-    print_header "Producing Sample Messages"
+# Generate logs by interacting with source MinIO
+generate_logs() {
+    print_header "Generating API Logs on Source MinIO"
 
-    if ! docker compose exec -T kafka kafka-topics --bootstrap-server localhost:29092 --list 2>/dev/null | grep -q events; then
-        print_msg "$RED" "Error: Kafka is not running or 'events' topic doesn't exist"
+    if ! curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
+        print_msg "$RED" "Error: Source MinIO is not running"
         exit 1
     fi
 
-    print_msg "$YELLOW" "Sending 5 sample events to 'events' topic..."
+    print_msg "$YELLOW" "Creating test bucket and uploading objects to generate API logs..."
 
-    for i in {1..5}; do
-        timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        event_id="evt-$(date +%s)-$i"
-        event_types=("click" "view" "purchase" "signup" "logout")
-        event_type=${event_types[$((RANDOM % 5))]}
-        user_id=$((RANDOM % 1000 + 1))
+    # Use mc (MinIO Client) in a container to interact with source MinIO
+    docker run --rm --network kafka-connect_kafka-iceberg \
+        -e MC_HOST_source=http://minioadmin:minioadmin@nginx-source:9000 \
+        minio/mc:latest bash -c "
+        echo 'Creating test bucket...'
+        mc mb source/test-logs-bucket --ignore-existing
 
-        message="{\"event_id\": \"$event_id\", \"event_type\": \"$event_type\", \"user_id\": $user_id, \"timestamp\": \"$timestamp\", \"payload\": {\"page\": \"/home\", \"device\": \"mobile\"}}"
+        echo 'Uploading test objects...'
+        for i in 1 2 3 4 5; do
+            echo \"Test object \$i - \$(date)\" | mc pipe source/test-logs-bucket/test-\$i.txt
+            echo \"  Uploaded: test-\$i.txt\"
+        done
 
-        echo "$message" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic events
+        echo ''
+        echo 'Listing bucket contents...'
+        mc ls source/test-logs-bucket/
 
-        print_msg "$GREEN" "✓ Sent: $event_id ($event_type)"
-    done
+        echo ''
+        echo 'Getting object stats...'
+        mc stat source/test-logs-bucket/test-1.txt
+        "
 
+    print_msg "$GREEN" ""
+    print_msg "$GREEN" "✓ API logs generated!"
     print_msg "$CYAN" ""
-    print_msg "$CYAN" "Messages sent! The Iceberg sink commits every 10 seconds."
-    print_msg "$CYAN" "Check MinIO Console at http://localhost:9001 to see the data files."
-    print_msg "$CYAN" "Run '$0 query' to query the Iceberg table."
+    print_msg "$CYAN" "Each S3 API call generates a log entry sent to Kafka."
+    print_msg "$CYAN" "The Iceberg sink commits every 10 seconds."
+    print_msg "$CYAN" ""
+    print_msg "$CYAN" "View the events in Kafka:"
+    print_msg "$CYAN" "  docker exec kafka kafka-console-consumer --bootstrap-server localhost:29092 --topic events --from-beginning --max-messages 5"
+    print_msg "$CYAN" ""
+    print_msg "$CYAN" "Query the Iceberg table:"
+    print_msg "$CYAN" "  $0 query"
+    print_msg "$CYAN" ""
+    print_msg "$CYAN" "View Destination MinIO Console (Iceberg data):"
+    print_msg "$CYAN" "  http://localhost:9011"
 }
 
-# Query the Iceberg table
+# Query the Iceberg table on destination MinIO
 query_table() {
-    print_header "Querying Iceberg Table"
+    print_header "Querying Iceberg Table on Destination MinIO"
 
     print_msg "$YELLOW" "Installing PyIceberg and querying table..."
 
@@ -316,18 +451,18 @@ query_table() {
 import json
 from pyiceberg.catalog import load_catalog
 
-print('Connecting to catalog...')
+print('Connecting to Destination MinIO Iceberg catalog...')
 try:
     catalog = load_catalog(
         'aistor',
         type='rest',
-        uri='http://minio:9000/_iceberg',
+        uri='http://nginx-dest:9000/_iceberg',
         warehouse='kafkawarehouse',
         **{
             'rest.sigv4-enabled': 'true',
             'rest.signing-name': 's3tables',
             'rest.signing-region': 'us-east-1',
-            's3.endpoint': 'http://minio:9000',
+            's3.endpoint': 'http://nginx-dest:9000',
             's3.access-key-id': 'minioadmin',
             's3.secret-access-key': 'minioadmin',
             's3.path-style-access': 'true',
@@ -345,7 +480,10 @@ try:
         # Show summary columns first
         summary_cols = ['time', 'name', 'type', 'bucket', 'object', 'node', 'origin']
         available_cols = [c for c in summary_cols if c in df.columns]
-        print(df[available_cols].tail(10).to_string())
+        if available_cols:
+            print(df[available_cols].tail(10).to_string())
+        else:
+            print(df.tail(10).to_string())
         print(f'\\nTotal rows: {len(df)}')
 
         # Pretty print last row with full details
@@ -361,12 +499,12 @@ try:
             elif value is not None:
                 print(f'{key}: {value}')
     else:
-        print('No data yet. Run: ./kafka-connect-iceberg-sink.sh produce')
+        print('No data yet. Run: ./kafka-connect-iceberg-sink.sh generate-logs')
 
 except Exception as e:
     print(f'Error: {e}')
-    print('\\nTable may not exist yet. Send some messages first:')
-    print('  ./kafka-connect-iceberg-sink.sh produce')
+    print('\\nTable may not exist yet. Generate some logs first:')
+    print('  ./kafka-connect-iceberg-sink.sh generate-logs')
 PYEOF
         "
 }
@@ -395,8 +533,8 @@ main() {
             shift
             show_logs "$@"
             ;;
-        produce)
-            produce_messages
+        generate-logs|produce)
+            generate_logs
             ;;
         query)
             query_table
