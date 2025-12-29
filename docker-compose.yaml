@@ -1,12 +1,187 @@
-# Kafka Connect Iceberg Sink to MinIO AIStor
-# This setup streams data from Kafka topics to Iceberg tables on MinIO
+# Kafka Connect Iceberg Sink - Dual Distributed MinIO Cluster Setup
+# =================================================================
+# Source Cluster: 4-node MinIO with Kafka log targets (PR #2463)
+# Destination Cluster: 4-node MinIO with Iceberg Tables support
+# Pipeline: Source MinIO -> Kafka -> Kafka Connect -> Iceberg -> Destination MinIO
+
+# =============================================================================
+# YAML Anchors for reusable configurations
+# =============================================================================
+
+x-minio-source-common: &minio-source-common
+  image: ${MINIO_SOURCE_IMAGE}
+  command: server --console-address ":9001" http://minio-src-{1...4}/data{1...2}
+  expose:
+    - "9000"
+    - "9001"
+  environment:
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    MINIO_LICENSE: ${MINIO_LICENSE}
+    # Kafka log targets configuration (from PR #2463)
+    MINIO_LOG_API_KAFKA_ENABLE: "on"
+    MINIO_LOG_API_KAFKA_BROKERS: kafka:29092
+    MINIO_LOG_API_KAFKA_TOPIC: events
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+    interval: 5s
+    timeout: 10s
+    retries: 5
+    start_period: 30s
+  networks:
+    - kafka-iceberg
+
+x-minio-dest-common: &minio-dest-common
+  image: ${MINIO_DEST_IMAGE}
+  command: server --console-address ":9001" http://minio-dst-{1...4}/data{1...2}
+  expose:
+    - "9000"
+    - "9001"
+  environment:
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    MINIO_LICENSE: ${MINIO_LICENSE}
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+    interval: 5s
+    timeout: 10s
+    retries: 5
+    start_period: 30s
+  networks:
+    - kafka-iceberg
 
 services:
-  # ============================================================================
-  # Kafka Broker (KRaft mode - no Zookeeper required)
-  # ============================================================================
+  # ===========================================================================
+  # SOURCE MINIO CLUSTER (4-node distributed with Kafka log targets)
+  # ===========================================================================
+  minio-src-1:
+    <<: *minio-source-common
+    hostname: minio-src-1
+    container_name: minio-src-1
+    volumes:
+      - minio-src-1-data1:/data1
+      - minio-src-1-data2:/data2
+
+  minio-src-2:
+    <<: *minio-source-common
+    hostname: minio-src-2
+    container_name: minio-src-2
+    volumes:
+      - minio-src-2-data1:/data1
+      - minio-src-2-data2:/data2
+
+  minio-src-3:
+    <<: *minio-source-common
+    hostname: minio-src-3
+    container_name: minio-src-3
+    volumes:
+      - minio-src-3-data1:/data1
+      - minio-src-3-data2:/data2
+
+  minio-src-4:
+    <<: *minio-source-common
+    hostname: minio-src-4
+    container_name: minio-src-4
+    volumes:
+      - minio-src-4-data1:/data1
+      - minio-src-4-data2:/data2
+
+  # Nginx load balancer for source cluster
+  nginx-source:
+    image: nginx:1.25-alpine
+    hostname: nginx-source
+    container_name: nginx-source
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./nginx/nginx-source.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      minio-src-1:
+        condition: service_healthy
+      minio-src-2:
+        condition: service_healthy
+      minio-src-3:
+        condition: service_healthy
+      minio-src-4:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - kafka-iceberg
+
+  # ===========================================================================
+  # DESTINATION MINIO CLUSTER (4-node distributed with Iceberg Tables)
+  # ===========================================================================
+  minio-dst-1:
+    <<: *minio-dest-common
+    hostname: minio-dst-1
+    container_name: minio-dst-1
+    volumes:
+      - minio-dst-1-data1:/data1
+      - minio-dst-1-data2:/data2
+
+  minio-dst-2:
+    <<: *minio-dest-common
+    hostname: minio-dst-2
+    container_name: minio-dst-2
+    volumes:
+      - minio-dst-2-data1:/data1
+      - minio-dst-2-data2:/data2
+
+  minio-dst-3:
+    <<: *minio-dest-common
+    hostname: minio-dst-3
+    container_name: minio-dst-3
+    volumes:
+      - minio-dst-3-data1:/data1
+      - minio-dst-3-data2:/data2
+
+  minio-dst-4:
+    <<: *minio-dest-common
+    hostname: minio-dst-4
+    container_name: minio-dst-4
+    volumes:
+      - minio-dst-4-data1:/data1
+      - minio-dst-4-data2:/data2
+
+  # Nginx load balancer for destination cluster
+  nginx-dest:
+    image: nginx:1.25-alpine
+    hostname: nginx-dest
+    container_name: nginx-dest
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - ./nginx/nginx-dest.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      minio-dst-1:
+        condition: service_healthy
+      minio-dst-2:
+        condition: service_healthy
+      minio-dst-3:
+        condition: service_healthy
+      minio-dst-4:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - kafka-iceberg
+
+  # ===========================================================================
+  # KAFKA (KRaft mode - no Zookeeper required)
+  # ===========================================================================
   kafka:
-    image: confluentinc/cp-kafka:7.5.0
+    image: ${KAFKA_IMAGE}
     hostname: kafka
     container_name: kafka
     ports:
@@ -34,15 +209,17 @@ services:
     networks:
       - kafka-iceberg
 
-  # ============================================================================
-  # Kafka Connect with Iceberg Sink Connector
-  # ============================================================================
+  # ===========================================================================
+  # KAFKA CONNECT with Iceberg Sink Connector
+  # ===========================================================================
   kafka-connect:
-    image: confluentinc/cp-kafka-connect:7.5.0
+    image: ${KAFKA_CONNECT_IMAGE}
     hostname: kafka-connect
     container_name: kafka-connect
     depends_on:
       kafka:
+        condition: service_healthy
+      nginx-dest:
         condition: service_healthy
     ports:
       - "8083:8083"
@@ -71,8 +248,8 @@ services:
       CONNECT_PLUGIN_PATH: /usr/share/java,/usr/share/confluent-hub-components,/plugins
 
       # AWS credentials for SigV4 signing (used by Iceberg REST catalog)
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
       AWS_REGION: us-east-1
 
       # Logging
@@ -89,47 +266,9 @@ services:
     networks:
       - kafka-iceberg
 
-  # ============================================================================
-  # MinIO AIStor (Single Node for Demo)
-  # ============================================================================
-  minio:
-    image: praveenminio/eos:log
-    hostname: minio
-    container_name: minio
-    command: server /data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_LICENSE: ${MINIO_LICENSE}
-      # API Logs -> apilogs topic
-      MINIO_LOG_API_KAFKA_ENABLE: "on"
-      MINIO_LOG_API_KAFKA_BROKERS: kafka:29092
-      MINIO_LOG_API_KAFKA_TOPIC: apilogs
-      # Error Logs -> errorlogs topic
-      MINIO_LOG_ERROR_KAFKA_ENABLE: "on"
-      MINIO_LOG_ERROR_KAFKA_BROKERS: kafka:29092
-      MINIO_LOG_ERROR_KAFKA_TOPIC: errorlogs
-      # Audit Logs -> auditlogs topic
-      MINIO_LOG_AUDIT_KAFKA_ENABLE: "on"
-      MINIO_LOG_AUDIT_KAFKA_BROKERS: kafka:29092
-      MINIO_LOG_AUDIT_KAFKA_TOPIC: auditlogs
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 10s
-      retries: 5
-      start_period: 10s
-    volumes:
-      - minio-data:/data
-    networks:
-      - kafka-iceberg
-
-  # ============================================================================
-  # Init Container - Creates topics, warehouse, namespace, and deploys connector
-  # ============================================================================
+  # ===========================================================================
+  # INIT CONTAINER - Creates topics, warehouse, namespace, and deploys connector
+  # ===========================================================================
   init:
     image: python:3.11-slim
     container_name: kafka-iceberg-init
@@ -138,50 +277,33 @@ services:
         condition: service_healthy
       kafka-connect:
         condition: service_healthy
-      minio:
+      nginx-source:
         condition: service_healthy
-      trino:
+      nginx-dest:
         condition: service_healthy
     volumes:
       - ./init-setup.py:/init-setup.py:ro,z
     environment:
-      MINIO_ENDPOINT: http://minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      # Source MinIO (for generating logs)
+      MINIO_SOURCE_ENDPOINT: http://nginx-source:9000
+      MINIO_SOURCE_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SOURCE_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      # Destination MinIO (for Iceberg tables)
+      MINIO_DEST_ENDPOINT: http://nginx-dest:9000
+      MINIO_DEST_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_DEST_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      # Kafka
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       KAFKA_CONNECT_URL: http://kafka-connect:8083
-      WAREHOUSE_NAME: kafkawarehouse
-      NAMESPACE_NAME: streaming
-      TRINO_HOST: trino
-      TRINO_PORT: 8080
+      # Iceberg configuration
+      WAREHOUSE_NAME: ${WAREHOUSE_NAME}
+      NAMESPACE_NAME: ${NAMESPACE_NAME}
+      TABLE_NAME: ${TABLE_NAME}
     entrypoint: >
       bash -c "
-        pip install -q boto3 requests kafka-python trino &&
+        pip install -q boto3 requests kafka-python &&
         python /init-setup.py
       "
-    networks:
-      - kafka-iceberg
-
-  # ============================================================================
-  # Trino Query Engine - For querying Iceberg tables
-  # ============================================================================
-  trino:
-    image: trinodb/trino:477
-    hostname: trino
-    container_name: trino
-    depends_on:
-      minio:
-        condition: service_healthy
-    environment:
-      - CATALOG_MANAGEMENT=dynamic
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/status"]
-      interval: 5s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    ports:
-      - "9999:8080"
     networks:
       - kafka-iceberg
 
@@ -190,4 +312,21 @@ networks:
     driver: bridge
 
 volumes:
-  minio-data:
+  # Source cluster volumes
+  minio-src-1-data1:
+  minio-src-1-data2:
+  minio-src-2-data1:
+  minio-src-2-data2:
+  minio-src-3-data1:
+  minio-src-3-data2:
+  minio-src-4-data1:
+  minio-src-4-data2:
+  # Destination cluster volumes
+  minio-dst-1-data1:
+  minio-dst-1-data2:
+  minio-dst-2-data1:
+  minio-dst-2-data2:
+  minio-dst-3-data1:
+  minio-dst-3-data2:
+  minio-dst-4-data1:
+  minio-dst-4-data2:
