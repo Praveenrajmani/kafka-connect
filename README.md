@@ -77,10 +77,13 @@ Stream MinIO API access logs from a source cluster to Apache Iceberg tables on a
 
 ### 1. Configure License
 
-Edit `.env` and add your MinIO license:
+Copy the sample environment file and add your MinIO license:
 
 ```bash
-# Edit the .env file
+# Copy sample config to .env
+cp .env.sample .env
+
+# Edit and add your license key
 vi .env
 
 # Set MINIO_LICENSE=<your-license-key>
@@ -300,8 +303,8 @@ grep MINIO_LICENSE .env
 
 ```
 .
-├── .env                          # Configuration (license, images, credentials)
-├── .gitignore                    # Ignores plugins directory
+├── .env.sample                   # Sample config (copy to .env and add license)
+├── .gitignore                    # Ignores plugins directory and .env
 ├── docker-compose.yaml           # All service definitions
 ├── init-setup.py                 # Initialization script
 ├── kafka-connect-iceberg-sink.sh # Management script
