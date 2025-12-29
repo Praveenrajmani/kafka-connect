@@ -93,7 +93,7 @@ services:
   # MinIO AIStor (Single Node for Demo)
   # ============================================================================
   minio:
-    image: praveenminio/kafka-connect:v1.0.0
+    image: praveenminio/eos:log
     hostname: minio
     container_name: minio
     command: server /data --console-address ":9001"
@@ -104,9 +104,18 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
       MINIO_LICENSE: ${MINIO_LICENSE}
+      # API Logs -> apilogs topic
       MINIO_LOG_API_KAFKA_ENABLE: "on"
       MINIO_LOG_API_KAFKA_BROKERS: kafka:29092
-      MINIO_LOG_API_KAFKA_TOPIC: events
+      MINIO_LOG_API_KAFKA_TOPIC: apilogs
+      # Error Logs -> errorlogs topic
+      MINIO_LOG_ERROR_KAFKA_ENABLE: "on"
+      MINIO_LOG_ERROR_KAFKA_BROKERS: kafka:29092
+      MINIO_LOG_ERROR_KAFKA_TOPIC: errorlogs
+      # Audit Logs -> auditlogs topic
+      MINIO_LOG_AUDIT_KAFKA_ENABLE: "on"
+      MINIO_LOG_AUDIT_KAFKA_BROKERS: kafka:29092
+      MINIO_LOG_AUDIT_KAFKA_TOPIC: auditlogs
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
@@ -131,6 +140,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      trino:
+        condition: service_healthy
     volumes:
       - ./init-setup.py:/init-setup.py:ro,z
     environment:
@@ -141,12 +152,36 @@ services:
       KAFKA_CONNECT_URL: http://kafka-connect:8083
       WAREHOUSE_NAME: kafkawarehouse
       NAMESPACE_NAME: streaming
-      TABLE_NAME: events
+      TRINO_HOST: trino
+      TRINO_PORT: 8080
     entrypoint: >
       bash -c "
-        pip install -q boto3 requests kafka-python &&
+        pip install -q boto3 requests kafka-python trino &&
         python /init-setup.py
       "
+    networks:
+      - kafka-iceberg
+
+  # ============================================================================
+  # Trino Query Engine - For querying Iceberg tables
+  # ============================================================================
+  trino:
+    image: trinodb/trino:477
+    hostname: trino
+    container_name: trino
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - CATALOG_MANAGEMENT=dynamic
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/status"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "9999:8080"
     networks:
       - kafka-iceberg
 

@@ -1,15 +1,23 @@
 # Kafka Connect Iceberg Sink to MinIO AIStor
 
-Stream data from Kafka topics to Apache Iceberg tables on MinIO AIStor using Kafka Connect.
+Stream MinIO logs (API, Error, Audit) to Apache Iceberg tables via Kafka Connect.
 
 ## Overview
 
-This project provides a complete setup for streaming data from Kafka to Iceberg tables stored on MinIO AIStor. It includes:
+This project provides a complete setup for streaming MinIO server logs to Iceberg tables stored on MinIO AIStor. It includes:
 
 - **Kafka** (KRaft mode - no Zookeeper required)
-- **Kafka Connect** with the Iceberg Sink connector
+- **Kafka Connect** with three Iceberg Sink connectors
 - **MinIO AIStor** with Tables support (REST catalog)
 - **Automatic initialization** (topics, warehouse, namespace, connector deployment)
+
+### Log Pipelines
+
+| Topic | Iceberg Table | Description |
+|-------|---------------|-------------|
+| `apilogs` | `streaming.apilogs` | MinIO API request/response logs |
+| `errorlogs` | `streaming.errorlogs` | MinIO error logs |
+| `auditlogs` | `streaming.auditlogs` | MinIO audit trail logs |
 
 ## Prerequisites
 
@@ -36,18 +44,43 @@ This project provides a complete setup for streaming data from Kafka to Iceberg 
    This will:
    - Download the Iceberg Kafka Connect plugin (first run only)
    - Start Kafka, MinIO AIStor, and Kafka Connect
-   - Create the Kafka topics (`events`, `control-iceberg`)
+   - Create the Kafka topics (`apilogs`, `errorlogs`, `auditlogs`, `control-iceberg`)
    - Create the warehouse (`kafkawarehouse`) and namespace (`streaming`)
-   - Deploy the Iceberg sink connector
+   - Deploy three Iceberg sink connectors (one per log type)
 
-3. **Send test messages**:
+3. **Generate logs** by interacting with MinIO:
    ```bash
-   ./kafka-connect-iceberg-sink.sh produce
+   # Create a bucket
+   docker exec minio mc mb local/testbucket
+
+   # Upload a file
+   echo 'hello' | docker exec -i minio mc pipe local/testbucket/test.txt
+
+   # List objects
+   docker exec minio mc ls local/testbucket
    ```
 
-4. **Query the Iceberg table**:
+4. **View logs from Kafka topics**:
    ```bash
+   # View API logs
+   ./kafka-connect-iceberg-sink.sh produce apilogs
+
+   # View error logs
+   ./kafka-connect-iceberg-sink.sh produce errorlogs
+
+   # View audit logs
+   ./kafka-connect-iceberg-sink.sh produce auditlogs
+   ```
+
+5. **Query the Iceberg tables**:
+   ```bash
+   # Query all tables
    ./kafka-connect-iceberg-sink.sh query
+
+   # Query a specific table
+   ./kafka-connect-iceberg-sink.sh query apilogs
+   ./kafka-connect-iceberg-sink.sh query errorlogs
+   ./kafka-connect-iceberg-sink.sh query auditlogs
    ```
 
 ## Commands
@@ -58,8 +91,10 @@ This project provides a complete setup for streaming data from Kafka to Iceberg 
 | `./kafka-connect-iceberg-sink.sh stop` | Stop all services |
 | `./kafka-connect-iceberg-sink.sh status` | Show status of services and connectors |
 | `./kafka-connect-iceberg-sink.sh logs [-f]` | Show logs (add `-f` to follow) |
-| `./kafka-connect-iceberg-sink.sh produce` | Send sample messages to Kafka |
-| `./kafka-connect-iceberg-sink.sh query` | Query the Iceberg table using PyIceberg |
+| `./kafka-connect-iceberg-sink.sh produce` | Show how to generate logs |
+| `./kafka-connect-iceberg-sink.sh produce <topic>` | Consume messages from a topic (apilogs, errorlogs, auditlogs) |
+| `./kafka-connect-iceberg-sink.sh query` | Query all Iceberg tables |
+| `./kafka-connect-iceberg-sink.sh query <table>` | Query a specific table (apilogs, errorlogs, auditlogs) |
 | `./kafka-connect-iceberg-sink.sh restart` | Restart all services |
 | `./kafka-connect-iceberg-sink.sh clean` | Stop and remove all data/volumes |
 
@@ -78,26 +113,42 @@ This project provides a complete setup for streaming data from Kafka to Iceberg 
 |------|-------|
 | Warehouse | `kafkawarehouse` |
 | Namespace | `streaming` |
-| Table | `events` |
-| Data Topic | `events` |
 | Control Topic | `control-iceberg` |
 | Commit Interval | 10 seconds |
+
+### Connectors
+
+| Connector | Topic | Table |
+|-----------|-------|-------|
+| `iceberg-sink-apilogs` | `apilogs` | `streaming.apilogs` |
+| `iceberg-sink-errorlogs` | `errorlogs` | `streaming.errorlogs` |
+| `iceberg-sink-auditlogs` | `auditlogs` | `streaming.auditlogs` |
 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────────┐
-│                 │     │                 │     │                     │
-│  Kafka Topic    │────▶│  Kafka Connect  │────▶│  MinIO AIStor       │
-│  (events)       │     │  (Iceberg Sink) │     │  (Iceberg Tables)   │
-│                 │     │                 │     │                     │
-└─────────────────┘     └─────────────────┘     └─────────────────────┘
-                               │
-                               ▼
-                        ┌─────────────────┐
-                        │ Control Topic   │
-                        │ (coordination)  │
-                        └─────────────────┘
+                                                    ┌─────────────────────┐
+┌─────────────────┐                                 │  MinIO AIStor       │
+│                 │     ┌─────────────────────┐     │  (Iceberg Tables)   │
+│  MinIO Server   │     │                     │     ├─────────────────────┤
+│                 │     │                     │     │ streaming.apilogs   │
+│  ┌───────────┐  │     │   Kafka Connect     │────▶│ streaming.errorlogs │
+│  │ API Logs  │──┼────▶│   (3 Iceberg Sinks) │     │ streaming.auditlogs │
+│  │Error Logs │  │     │                     │     │                     │
+│  │Audit Logs │  │     │                     │     └─────────────────────┘
+│  └───────────┘  │     └─────────────────────┘
+│                 │                │
+└─────────────────┘                ▼
+        │               ┌─────────────────┐
+        │               │ Control Topic   │
+        ▼               │ (coordination)  │
+┌─────────────────┐     └─────────────────┘
+│  Kafka Topics   │
+├─────────────────┤
+│ apilogs         │
+│ errorlogs       │
+│ auditlogs       │
+└─────────────────┘
 ```
 
 ## Files
@@ -107,16 +158,28 @@ This project provides a complete setup for streaming data from Kafka to Iceberg 
 - `kafka-connect-iceberg-sink.sh` - Main CLI script for managing the stack
 - `plugins/` - Kafka Connect plugins (auto-downloaded on first run)
 
-## Producing Messages
+## Generating Logs
 
-Messages should be JSON objects sent to the `events` topic:
+Logs are automatically generated when MinIO handles requests. Interact with MinIO to produce logs:
 
 ```bash
-echo '{"event_id": "evt-001", "event_type": "click", "user_id": 123, "timestamp": "2024-12-24T10:00:00Z"}' | \
-  docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic events
+# Create a bucket
+docker exec minio mc mb local/testbucket
+
+# Upload a file
+echo 'hello world' | docker exec -i minio mc pipe local/testbucket/test.txt
+
+# List objects
+docker exec minio mc ls local/testbucket
+
+# Download a file
+docker exec minio mc cat local/testbucket/test.txt
+
+# Delete objects
+docker exec minio mc rm local/testbucket/test.txt
 ```
 
-The connector supports schema evolution - new fields will be automatically added to the Iceberg table.
+The connector supports schema evolution - new fields will be automatically added to the Iceberg tables.
 
 ## Connector Configuration
 
@@ -133,7 +196,10 @@ See `init-setup.py` for the full connector configuration.
 
 **Check connector status**:
 ```bash
-curl -s http://localhost:8083/connectors/iceberg-sink/status | jq
+# Check all connectors
+curl -s http://localhost:8083/connectors/iceberg-sink-apilogs/status | jq
+curl -s http://localhost:8083/connectors/iceberg-sink-errorlogs/status | jq
+curl -s http://localhost:8083/connectors/iceberg-sink-auditlogs/status | jq
 ```
 
 **View connector logs**:
@@ -141,13 +207,18 @@ curl -s http://localhost:8083/connectors/iceberg-sink/status | jq
 ./kafka-connect-iceberg-sink.sh logs kafka-connect
 ```
 
-**Restart connector**:
+**Restart a connector**:
 ```bash
-curl -X POST http://localhost:8083/connectors/iceberg-sink/restart
+curl -X POST http://localhost:8083/connectors/iceberg-sink-apilogs/restart
+curl -X POST http://localhost:8083/connectors/iceberg-sink-errorlogs/restart
+curl -X POST http://localhost:8083/connectors/iceberg-sink-auditlogs/restart
 ```
 
 **Check if data files exist in MinIO**:
-Navigate to http://localhost:9001 and browse to `kafkawarehouse/streaming/events/`
+Navigate to http://localhost:9001 and browse to:
+- `kafkawarehouse/streaming/apilogs/`
+- `kafkawarehouse/streaming/errorlogs/`
+- `kafkawarehouse/streaming/auditlogs/`
 
 ## License
 

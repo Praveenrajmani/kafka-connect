@@ -46,6 +46,8 @@ usage() {
     cat << EOF
 Kafka Connect Iceberg Sink to MinIO AIStor
 
+Streams MinIO logs (API, Error, Audit) to Iceberg tables via Kafka Connect.
+
 USAGE:
   $0 [command] [options]
 
@@ -54,10 +56,17 @@ COMMANDS:
   stop            Stop all services
   status          Show status of all services
   logs            Show logs (use -f for follow)
-  produce         Produce sample messages to Kafka
-  query           Query the Iceberg table
+  produce [topic] [-n NUM] Produce sample messages (default: 100)
+  query [table]   Query Iceberg table(s)
   restart         Restart all services
   clean           Stop and remove all data
+
+LOG PIPELINES:
+  Topic       Table                  Description
+  ─────────   ────────────────────   ─────────────────────
+  apilogs     streaming.apilogs      MinIO API logs
+  errorlogs   streaming.errorlogs    MinIO Error logs
+  auditlogs   streaming.auditlogs    MinIO Audit logs
 
 OPTIONS:
   -h, --help      Show this help message
@@ -69,14 +78,30 @@ EXAMPLES:
   # Check status
   $0 status
 
-  # Produce test messages
+  # Produce 100 messages to all topics (default)
   $0 produce
+
+  # Produce 500 messages to all topics
+  $0 produce -n 500
+
+  # Produce 100 messages to a specific topic
+  $0 produce apilogs
+  $0 produce errorlogs
+  $0 produce auditlogs
+
+  # Produce 1000 messages to a specific topic
+  $0 produce apilogs -n 1000
+
+  # Query all Iceberg tables
+  $0 query
+
+  # Query a specific table
+  $0 query apilogs
+  $0 query errorlogs
+  $0 query auditlogs
 
   # View logs
   $0 logs -f
-
-  # Query Iceberg table
-  $0 query
 
   # Stop services
   $0 stop
@@ -203,9 +228,10 @@ start_services() {
     │                      (user: minioadmin / pass: minioadmin)      │
     │  MinIO API:          http://localhost:9000                      │
     │                                                                 │
-    │  Connector:          iceberg-sink                               │
-    │  Data Topic:         events                                     │
-    │  Iceberg Table:      kafkawarehouse.streaming.events            │
+    │  Log Pipelines:                                                 │
+    │    • apilogs   → streaming.apilogs   (API logs)                 │
+    │    • errorlogs → streaming.errorlogs (Error logs)               │
+    │    • auditlogs → streaming.auditlogs (Audit logs)               │
     │                                                                 │
     └─────────────────────────────────────────────────────────────────┘
 EOF
@@ -269,52 +295,204 @@ show_logs() {
     docker compose logs "$@"
 }
 
-# Produce sample messages
-produce_messages() {
-    print_header "Producing Sample Messages"
+# Generate a single log message for a given type
+# Args: $1 = type (api|error|audit), $2 = index (for variation)
+generate_log_message() {
+    local msg_type="$1"
+    local index="$2"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+    local request_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "17A3C4775707B695-$index")
 
-    if ! docker compose exec -T kafka kafka-topics --bootstrap-server localhost:29092 --list 2>/dev/null | grep -q events; then
-        print_msg "$RED" "Error: Kafka is not running or 'events' topic doesn't exist"
+    # Arrays for variation
+    local api_names=("s3.GetObject" "s3.PutObject" "s3.DeleteObject" "s3.ListObjects" "s3.HeadObject")
+    local buckets=("testbucket" "databucket" "logsbucket" "backupbucket")
+    local objects=("file-${index}.txt" "data-${index}.json" "image-${index}.png" "doc-${index}.pdf")
+    local sources=("192.168.1.$((100 + index % 50))" "10.0.0.$((1 + index % 254))" "172.16.0.$((1 + index % 100))")
+    local status_codes=(200 200 200 200 201 204 404 403 500)
+    local error_messages=("The specified bucket does not exist" "Access Denied" "Object not found" "Internal server error" "Request timeout")
+
+    # Pick values based on index for variation
+    local api_name="${api_names[$((index % ${#api_names[@]}))]}"
+    local bucket="${buckets[$((index % ${#buckets[@]}))]}"
+    local object="${objects[$((index % ${#objects[@]}))]}"
+    local source="${sources[$((index % ${#sources[@]}))]}"
+    local status_code="${status_codes[$((index % ${#status_codes[@]}))]}"
+    local error_msg="${error_messages[$((index % ${#error_messages[@]}))]}"
+
+    case "$msg_type" in
+        api)
+            # API log message based on log.API struct
+            cat <<EOF
+{"version":"1","time":"$timestamp","node":"minio-node-$((1 + index % 3))","origin":"client","type":"object","name":"$api_name","bucket":"$bucket","object":"$object","versionId":"","tags":{},"callInfo":{"httpStatusCode":$status_code,"rx":$((index * 10)),"tx":$((1024 + index * 100)),"txHeaders":256,"timeToFirstByte":"$((2 + index % 10))ms","requestReadTime":"$((1 + index % 5))ms","responseWriteTime":"$((5 + index % 20))ms","requestTime":"$((10 + index % 50))ms","timeToResponse":"$((8 + index % 30))ms","sourceHost":"$source","requestID":"$request_id","userAgent":"MinIO (linux; amd64) minio-go/v7.0.0","requestPath":"/$bucket/$object","requestHost":"localhost:9000","accessKey":"minioadmin"}}
+EOF
+            ;;
+        error)
+            # Error log message based on log.Error struct
+            cat <<EOF
+{"version":"1","node":"minio-node-$((1 + index % 3))","time":"$timestamp","message":"$error_msg","apiName":"$api_name","trace":{"message":"$error_msg","source":["api-errors.go:$((100 + index))","bucket-handlers.go:$((400 + index))"]},"tags":{"bucket":"$bucket"}}
+EOF
+            ;;
+        audit)
+            # Audit log message based on log.Audit struct
+            local actions=("read" "write" "delete" "list")
+            local action="${actions[$((index % ${#actions[@]}))]}"
+            cat <<EOF
+{"version":"1","time":"$timestamp","node":"minio-node-$((1 + index % 3))","apiName":"$api_name","category":"object","action":"$action","bucket":"$bucket","tags":{},"requestID":"$request_id","requestClaims":{},"sourceHost":"$source","accessKey":"minioadmin","parentUser":"","details":{"object":"$object","versionId":""}}
+EOF
+            ;;
+    esac
+}
+
+# Produce sample messages to Kafka topics based on MinIO log structs
+# See: https://github.com/minio/madmin-go/blob/main/log
+produce_messages() {
+    local topic=""
+    local count=100
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n)
+                count="$2"
+                shift 2
+                ;;
+            *)
+                if [ -z "$topic" ]; then
+                    topic="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate count
+    if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ]; then
+        print_msg "$RED" "Invalid count: $count. Must be a positive integer."
         exit 1
     fi
 
-    print_msg "$YELLOW" "Sending 5 sample events to 'events' topic..."
+    # If a specific topic is provided, produce to it
+    if [ -n "$topic" ]; then
+        case "$topic" in
+            apilogs)
+                print_header "Producing $count messages to '$topic' topic"
+                for ((i=1; i<=count; i++)); do
+                    generate_log_message "api" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic "$topic"
+                    if [ $((i % 10)) -eq 0 ]; then
+                        printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+                    fi
+                done
+                echo ""
+                print_msg "$GREEN" "✓ $count API log messages produced to '$topic'"
+                ;;
+            errorlogs)
+                print_header "Producing $count messages to '$topic' topic"
+                for ((i=1; i<=count; i++)); do
+                    generate_log_message "error" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic "$topic"
+                    if [ $((i % 10)) -eq 0 ]; then
+                        printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+                    fi
+                done
+                echo ""
+                print_msg "$GREEN" "✓ $count error log messages produced to '$topic'"
+                ;;
+            auditlogs)
+                print_header "Producing $count messages to '$topic' topic"
+                for ((i=1; i<=count; i++)); do
+                    generate_log_message "audit" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic "$topic"
+                    if [ $((i % 10)) -eq 0 ]; then
+                        printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+                    fi
+                done
+                echo ""
+                print_msg "$GREEN" "✓ $count audit log messages produced to '$topic'"
+                ;;
+            *)
+                print_msg "$RED" "Unknown topic: $topic"
+                print_msg "$YELLOW" "Valid topics: apilogs, errorlogs, auditlogs"
+                exit 1
+                ;;
+        esac
+        return
+    fi
 
-    for i in {1..5}; do
-        timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        event_id="evt-$(date +%s)-$i"
-        event_types=("click" "view" "purchase" "signup" "logout")
-        event_type=${event_types[$((RANDOM % 5))]}
-        user_id=$((RANDOM % 1000 + 1))
+    # No topic specified - produce to all topics
+    print_header "Producing $count Messages to Each Topic"
 
-        message="{\"event_id\": \"$event_id\", \"event_type\": \"$event_type\", \"user_id\": $user_id, \"timestamp\": \"$timestamp\", \"payload\": {\"page\": \"/home\", \"device\": \"mobile\"}}"
+    print_msg "$YELLOW" "Sending $count messages to each log topic (total: $((count * 3)) messages)..."
+    echo ""
 
-        echo "$message" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic events
-
-        print_msg "$GREEN" "✓ Sent: $event_id ($event_type)"
+    print_msg "$CYAN" "Producing to 'apilogs'..."
+    for ((i=1; i<=count; i++)); do
+        generate_log_message "api" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic apilogs
+        if [ $((i % 10)) -eq 0 ]; then
+            printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+        fi
     done
+    echo ""
+    print_msg "$GREEN" "✓ $count API log messages produced to 'apilogs'"
 
-    print_msg "$CYAN" ""
-    print_msg "$CYAN" "Messages sent! The Iceberg sink commits every 10 seconds."
+    print_msg "$CYAN" "Producing to 'errorlogs'..."
+    for ((i=1; i<=count; i++)); do
+        generate_log_message "error" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic errorlogs
+        if [ $((i % 10)) -eq 0 ]; then
+            printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+        fi
+    done
+    echo ""
+    print_msg "$GREEN" "✓ $count error log messages produced to 'errorlogs'"
+
+    print_msg "$CYAN" "Producing to 'auditlogs'..."
+    for ((i=1; i<=count; i++)); do
+        generate_log_message "audit" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic auditlogs
+        if [ $((i % 10)) -eq 0 ]; then
+            printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+        fi
+    done
+    echo ""
+    print_msg "$GREEN" "✓ $count audit log messages produced to 'auditlogs'"
+
+    echo ""
+    print_msg "$CYAN" "The Iceberg sink commits every 10 seconds."
     print_msg "$CYAN" "Check MinIO Console at http://localhost:9001 to see the data files."
-    print_msg "$CYAN" "Run '$0 query' to query the Iceberg table."
+    print_msg "$CYAN" "Run '$0 query' to query the Iceberg tables."
 }
 
-# Query the Iceberg table
+# Query the Iceberg tables
 query_table() {
-    print_header "Querying Iceberg Table"
+    local table_filter="$1"
 
-    print_msg "$YELLOW" "Installing PyIceberg and querying table..."
+    # Validate table filter if provided
+    if [ -n "$table_filter" ]; then
+        case "$table_filter" in
+            apilogs|errorlogs|auditlogs)
+                print_header "Querying Iceberg Table: streaming.$table_filter"
+                ;;
+            *)
+                print_msg "$RED" "Unknown table: $table_filter"
+                print_msg "$YELLOW" "Valid tables: apilogs, errorlogs, auditlogs"
+                exit 1
+                ;;
+        esac
+    else
+        print_header "Querying All Iceberg Tables"
+    fi
+
+    print_msg "$YELLOW" "Installing PyIceberg and querying tables..."
 
     docker run --rm --network kafka-connect_kafka-iceberg \
         -e AWS_ACCESS_KEY_ID=minioadmin \
         -e AWS_SECRET_ACCESS_KEY=minioadmin \
         -e AWS_REGION=us-east-1 \
+        -e TABLE_FILTER="$table_filter" \
         python:3.11-slim bash -c "
         pip install -q pyiceberg[s3,pandas] boto3 2>/dev/null
         python3 << 'PYEOF'
+import os
 import json
 from pyiceberg.catalog import load_catalog
+
+table_filter = os.getenv('TABLE_FILTER', '')
 
 print('Connecting to catalog...')
 try:
@@ -336,37 +514,66 @@ try:
     )
 
     print('\\nNamespaces:', catalog.list_namespaces())
+    print('\\nTables:', catalog.list_tables('streaming'))
 
-    table = catalog.load_table('streaming.events')
+    # Define all tables
+    all_tables = [
+        ('streaming.apilogs', 'API Logs'),
+        ('streaming.errorlogs', 'Error Logs'),
+        ('streaming.auditlogs', 'Audit Logs'),
+    ]
 
-    print('\\nTable Data (last 10 rows - summary view):')
-    df = table.scan().to_pandas()
-    if len(df) > 0:
-        # Show summary columns first
-        summary_cols = ['time', 'name', 'type', 'bucket', 'object', 'node', 'origin']
-        available_cols = [c for c in summary_cols if c in df.columns]
-        print(df[available_cols].tail(10).to_string())
-        print(f'\\nTotal rows: {len(df)}')
-
-        # Pretty print last row with full details
-        print('\\n' + '='*60)
-        print('Last log entry (full details):')
-        print('='*60)
-        last_row = df.iloc[-1].to_dict()
-        # Convert nested dicts for pretty printing
-        for key, value in last_row.items():
-            if isinstance(value, dict):
-                print(f'\\n{key}:')
-                print(json.dumps(value, indent=2, default=str))
-            elif value is not None:
-                print(f'{key}: {value}')
+    # Filter if specific table requested
+    if table_filter:
+        tables = [(f'streaming.{table_filter}', f'{table_filter.replace(\"logs\", \" Logs\").title()}')]
     else:
-        print('No data yet. Run: ./kafka-connect-iceberg-sink.sh produce')
+        tables = all_tables
+
+    for table_name, description in tables:
+        print('\\n' + '='*70)
+        print(f'{description} ({table_name})')
+        print('='*70)
+
+        try:
+            table = catalog.load_table(table_name)
+            df = table.scan().to_pandas()
+
+            if len(df) > 0:
+                # Show summary columns
+                summary_cols = ['time', 'name', 'type', 'bucket', 'object', 'node', 'origin']
+                available_cols = [c for c in summary_cols if c in df.columns]
+                if available_cols:
+                    print(df[available_cols].tail(10 if table_filter else 5).to_string())
+                else:
+                    print(df.tail(10 if table_filter else 5).to_string())
+                print(f'\\nTotal rows: {len(df)}')
+
+                # Show full details of last row if querying single table
+                if table_filter and len(df) > 0:
+                    print('\\n' + '-'*70)
+                    print('Last entry (full details):')
+                    print('-'*70)
+                    last_row = df.iloc[-1].to_dict()
+                    for key, value in last_row.items():
+                        if isinstance(value, dict):
+                            print(f'\\n{key}:')
+                            print(json.dumps(value, indent=2, default=str))
+                        elif value is not None:
+                            print(f'{key}: {value}')
+            else:
+                print('No data yet.')
+        except Exception as e:
+            print(f'Table not found or empty: {e}')
+
+    print('\\n' + '='*70)
+    print('To generate logs, interact with MinIO:')
+    print('  docker exec minio mc mb local/testbucket')
+    print('  echo \"hello\" | docker exec -i minio mc pipe local/testbucket/test.txt')
+    print('='*70)
 
 except Exception as e:
     print(f'Error: {e}')
-    print('\\nTable may not exist yet. Send some messages first:')
-    print('  ./kafka-connect-iceberg-sink.sh produce')
+    print('\\nTables may not exist yet. Interact with MinIO to generate logs.')
 PYEOF
         "
 }
@@ -396,10 +603,12 @@ main() {
             show_logs "$@"
             ;;
         produce)
-            produce_messages
+            shift
+            produce_messages "$@"
             ;;
         query)
-            query_table
+            shift
+            query_table "$1"
             ;;
         restart)
             restart_services
