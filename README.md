@@ -62,31 +62,12 @@ Source MinIO (4-node)  →  Kafka  →  Kafka Connect  →  Destination MinIO (4
    - Deploy three Iceberg sink connectors (one per log type)
    - Create Trino catalog for querying
 
-3. **Generate logs** by interacting with the source MinIO cluster:
+3. **Generate API logs** on the source cluster:
    ```bash
-   # Using mc client
-   mc alias set source http://localhost:9000 minioadmin minioadmin
-
-   # Create a bucket
-   mc mb source/testbucket
-
-   # Upload a file
-   mc cp /etc/hosts source/testbucket/test.txt
-
-   # List objects
-   mc ls source/testbucket
+   ./kafka-connect-iceberg-sink.sh generate api --count 100
    ```
 
-4. **View logs from Kafka topics**:
-   ```bash
-   # View API logs
-   docker exec kafka kafka-console-consumer \
-     --bootstrap-server localhost:29092 \
-     --topic apilogs \
-     --from-beginning
-   ```
-
-5. **Query the Iceberg tables with Trino**:
+4. **Query the Iceberg tables with Trino**:
    ```bash
    # Connect to Trino CLI
    docker exec -it trino trino
