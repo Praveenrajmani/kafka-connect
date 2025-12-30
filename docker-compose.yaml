@@ -19,9 +19,18 @@ x-minio-source-common: &minio-source-common
     MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     MINIO_LICENSE: ${MINIO_LICENSE}
     # Kafka log targets configuration (from PR #2463)
+    # API logs
     MINIO_LOG_API_KAFKA_ENABLE: "on"
     MINIO_LOG_API_KAFKA_BROKERS: kafka:29092
-    MINIO_LOG_API_KAFKA_TOPIC: events
+    MINIO_LOG_API_KAFKA_TOPIC: ${API_LOGS_TOPIC:-apilogs}
+    # Error logs
+    MINIO_LOG_ERROR_KAFKA_ENABLE: "on"
+    MINIO_LOG_ERROR_KAFKA_BROKERS: kafka:29092
+    MINIO_LOG_ERROR_KAFKA_TOPIC: ${ERROR_LOGS_TOPIC:-errorlogs}
+    # Audit logs
+    MINIO_LOG_AUDIT_KAFKA_ENABLE: "on"
+    MINIO_LOG_AUDIT_KAFKA_BROKERS: kafka:29092
+    MINIO_LOG_AUDIT_KAFKA_TOPIC: ${AUDIT_LOGS_TOPIC:-auditlogs}
   healthcheck:
     test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
     interval: 5s
@@ -298,12 +307,41 @@ services:
       # Iceberg configuration
       WAREHOUSE_NAME: ${WAREHOUSE_NAME}
       NAMESPACE_NAME: ${NAMESPACE_NAME}
-      TABLE_NAME: ${TABLE_NAME}
+      # Kafka topics for 3 log types
+      API_LOGS_TOPIC: ${API_LOGS_TOPIC:-apilogs}
+      ERROR_LOGS_TOPIC: ${ERROR_LOGS_TOPIC:-errorlogs}
+      AUDIT_LOGS_TOPIC: ${AUDIT_LOGS_TOPIC:-auditlogs}
+      # Trino
+      TRINO_HOST: trino
+      TRINO_PORT: 8080
     entrypoint: >
       bash -c "
-        pip install -q boto3 requests kafka-python &&
+        pip install -q boto3 requests kafka-python trino &&
         python /init-setup.py
       "
+    networks:
+      - kafka-iceberg
+
+  # ===========================================================================
+  # TRINO QUERY ENGINE - For querying Iceberg tables
+  # ===========================================================================
+  trino:
+    image: trinodb/trino:477
+    hostname: trino
+    container_name: trino
+    depends_on:
+      nginx-dest:
+        condition: service_healthy
+    environment:
+      - CATALOG_MANAGEMENT=dynamic
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/status"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "9999:8080"
     networks:
       - kafka-iceberg
 

@@ -386,6 +386,169 @@ show_logs() {
     docker compose logs "$@"
 }
 
+# Generate a single log message for a given type
+# Args: $1 = type (api|error|audit), $2 = index (for variation)
+generate_log_message() {
+    local msg_type="$1"
+    local index="$2"
+    local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")
+    local request_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "17A3C4775707B695-$index")
+
+    # Arrays for variation
+    local api_names=("s3.GetObject" "s3.PutObject" "s3.DeleteObject" "s3.ListObjects" "s3.HeadObject")
+    local buckets=("testbucket" "databucket" "logsbucket" "backupbucket")
+    local objects=("file-${index}.txt" "data-${index}.json" "image-${index}.png" "doc-${index}.pdf")
+    local sources=("192.168.1.$((100 + index % 50))" "10.0.0.$((1 + index % 254))" "172.16.0.$((1 + index % 100))")
+    local status_codes=(200 200 200 200 201 204 404 403 500)
+    local error_messages=("The specified bucket does not exist" "Access Denied" "Object not found" "Internal server error" "Request timeout")
+
+    # Pick values based on index for variation
+    local api_name="${api_names[$((index % ${#api_names[@]}))]}"
+    local bucket="${buckets[$((index % ${#buckets[@]}))]}"
+    local object="${objects[$((index % ${#objects[@]}))]}"
+    local source="${sources[$((index % ${#sources[@]}))]}"
+    local status_code="${status_codes[$((index % ${#status_codes[@]}))]}"
+    local error_msg="${error_messages[$((index % ${#error_messages[@]}))]}"
+
+    case "$msg_type" in
+        api)
+            # API log message based on log.API struct
+            cat <<EOF
+{"version":"1","time":"$timestamp","node":"minio-node-$((1 + index % 3))","origin":"client","type":"object","name":"$api_name","bucket":"$bucket","object":"$object","versionId":"","tags":{},"callInfo":{"httpStatusCode":$status_code,"rx":$((index * 10)),"tx":$((1024 + index * 100)),"txHeaders":256,"timeToFirstByte":"$((2 + index % 10))ms","requestReadTime":"$((1 + index % 5))ms","responseWriteTime":"$((5 + index % 20))ms","requestTime":"$((10 + index % 50))ms","timeToResponse":"$((8 + index % 30))ms","sourceHost":"$source","requestID":"$request_id","userAgent":"MinIO (linux; amd64) minio-go/v7.0.0","requestPath":"/$bucket/$object","requestHost":"localhost:9000","accessKey":"minioadmin"}}
+EOF
+            ;;
+        error)
+            # Error log message based on log.Error struct
+            cat <<EOF
+{"version":"1","node":"minio-node-$((1 + index % 3))","time":"$timestamp","message":"$error_msg","apiName":"$api_name","trace":{"message":"$error_msg","source":["api-errors.go:$((100 + index))","bucket-handlers.go:$((400 + index))"]},"tags":{"bucket":"$bucket"}}
+EOF
+            ;;
+        audit)
+            # Audit log message based on log.Audit struct
+            local actions=("read" "write" "delete" "list")
+            local action="${actions[$((index % ${#actions[@]}))]}"
+            cat <<EOF
+{"version":"1","time":"$timestamp","node":"minio-node-$((1 + index % 3))","apiName":"$api_name","category":"object","action":"$action","bucket":"$bucket","tags":{},"requestID":"$request_id","requestClaims":{},"sourceHost":"$source","accessKey":"minioadmin","parentUser":"","details":{"object":"$object","versionId":""}}
+EOF
+            ;;
+    esac
+}
+
+# Produce sample messages to Kafka topics based on MinIO log structs
+# See: https://github.com/minio/madmin-go/blob/main/log
+produce_messages() {
+    local topic=""
+    local count=100
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n)
+                count="$2"
+                shift 2
+                ;;
+            *)
+                if [ -z "$topic" ]; then
+                    topic="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate count
+    if ! [[ "$count" =~ ^[0-9]+$ ]] || [ "$count" -lt 1 ]; then
+        print_msg "$RED" "Invalid count: $count. Must be a positive integer."
+        exit 1
+    fi
+
+    # If a specific topic is provided, produce to it
+    if [ -n "$topic" ]; then
+        case "$topic" in
+            apilogs)
+                print_header "Producing $count messages to '$topic' topic"
+                for ((i=1; i<=count; i++)); do
+                    generate_log_message "api" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic "$topic"
+                    if [ $((i % 10)) -eq 0 ]; then
+                        printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+                    fi
+                done
+                echo ""
+                print_msg "$GREEN" "✓ $count API log messages produced to '$topic'"
+                ;;
+            errorlogs)
+                print_header "Producing $count messages to '$topic' topic"
+                for ((i=1; i<=count; i++)); do
+                    generate_log_message "error" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic "$topic"
+                    if [ $((i % 10)) -eq 0 ]; then
+                        printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+                    fi
+                done
+                echo ""
+                print_msg "$GREEN" "✓ $count error log messages produced to '$topic'"
+                ;;
+            auditlogs)
+                print_header "Producing $count messages to '$topic' topic"
+                for ((i=1; i<=count; i++)); do
+                    generate_log_message "audit" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic "$topic"
+                    if [ $((i % 10)) -eq 0 ]; then
+                        printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+                    fi
+                done
+                echo ""
+                print_msg "$GREEN" "✓ $count audit log messages produced to '$topic'"
+                ;;
+            *)
+                print_msg "$RED" "Unknown topic: $topic"
+                print_msg "$YELLOW" "Valid topics: apilogs, errorlogs, auditlogs"
+                exit 1
+                ;;
+        esac
+        return
+    fi
+
+    # No topic specified - produce to all topics
+    print_header "Producing $count Messages to Each Topic"
+
+    print_msg "$YELLOW" "Sending $count messages to each log topic (total: $((count * 3)) messages)..."
+    echo ""
+
+    print_msg "$CYAN" "Producing to 'apilogs'..."
+    for ((i=1; i<=count; i++)); do
+        generate_log_message "api" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic apilogs
+        if [ $((i % 10)) -eq 0 ]; then
+            printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+        fi
+    done
+    echo ""
+    print_msg "$GREEN" "✓ $count API log messages produced to 'apilogs'"
+
+    print_msg "$CYAN" "Producing to 'errorlogs'..."
+    for ((i=1; i<=count; i++)); do
+        generate_log_message "error" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic errorlogs
+        if [ $((i % 10)) -eq 0 ]; then
+            printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+        fi
+    done
+    echo ""
+    print_msg "$GREEN" "✓ $count error log messages produced to 'errorlogs'"
+
+    print_msg "$CYAN" "Producing to 'auditlogs'..."
+    for ((i=1; i<=count; i++)); do
+        generate_log_message "audit" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic auditlogs
+        if [ $((i % 10)) -eq 0 ]; then
+            printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
+        fi
+    done
+    echo ""
+    print_msg "$GREEN" "✓ $count audit log messages produced to 'auditlogs'"
+
+    echo ""
+    print_msg "$CYAN" "The Iceberg sink commits every 10 seconds."
+    print_msg "$CYAN" "Check MinIO Console at http://localhost:9011 to see the data files."
+    print_msg "$CYAN" "Run '$0 query' to query the Iceberg tables."
+}
+
 # Generate logs by interacting with source MinIO
 generate_logs() {
     print_header "Generating API Logs on Source MinIO"
@@ -533,8 +696,12 @@ main() {
             shift
             show_logs "$@"
             ;;
-        generate-logs|produce)
+        generate-logs)
             generate_logs
+            ;;
+        produce)
+            shift
+            produce_messages "$@"
             ;;
         query)
             query_table
