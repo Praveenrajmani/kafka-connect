@@ -1,1 +1,4 @@
 plugins/
+
+# Environment file with secrets (copy from .env.sample)
+.env

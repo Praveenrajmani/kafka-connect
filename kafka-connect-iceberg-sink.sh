@@ -44,9 +44,16 @@ print_msg() {
 
 usage() {
     cat << EOF
-Kafka Connect Iceberg Sink to MinIO AIStor
+Kafka Connect Iceberg Sink to MinIO AIStor (Dual Cluster Architecture)
 
-Streams MinIO logs (API, Error, Audit) to Iceberg tables via Kafka Connect.
+Streams MinIO logs (API, Error, Audit) from a source cluster to Iceberg tables
+on a destination cluster via Kafka Connect.
+
+ARCHITECTURE:
+  Source MinIO (4-node) → Kafka → Kafka Connect → Dest MinIO (4-node)
+        ↓                                              ↑
+   nginx-source                                   nginx-dest
+   :9000/:9001                                   :9010/:9011
 
 USAGE:
   $0 [command] [options]
@@ -56,10 +63,17 @@ COMMANDS:
   stop            Stop all services
   status          Show status of all services
   logs            Show logs (use -f for follow)
-  produce [topic] [-n NUM] Produce sample messages (default: 100)
-  query [table]   Query Iceberg table(s)
+  generate <type> Generate logs on source cluster (api|error|audit|all)
+  query [table]   Query Iceberg table(s) with PyIceberg
   restart         Restart all services
   clean           Stop and remove all data
+
+SERVICES:
+  Source MinIO:      http://localhost:9000 (API), http://localhost:9001 (Console)
+  Destination MinIO: http://localhost:9010 (API), http://localhost:9011 (Console)
+  Kafka:             localhost:9092
+  Kafka Connect:     http://localhost:8083
+  Trino:             http://localhost:9999
 
 LOG PIPELINES:
   Topic       Table                  Description
@@ -78,27 +92,20 @@ EXAMPLES:
   # Check status
   $0 status
 
-  # Produce 100 messages to all topics (default)
-  $0 produce
+  # Generate logs on source cluster (flows to Iceberg tables)
+  $0 generate api              # Generate 100 API logs
+  $0 generate api --count 500  # Generate 500 API logs
+  $0 generate error            # Generate error logs
+  $0 generate audit            # Generate audit logs
+  $0 generate all --count 50   # Generate all log types (50 each)
 
-  # Produce 500 messages to all topics
-  $0 produce -n 500
+  # Query Iceberg tables with Trino
+  docker exec -it trino trino
+  SELECT * FROM kafkawarehouse.streaming.apilogs LIMIT 10;
 
-  # Produce 100 messages to a specific topic
-  $0 produce apilogs
-  $0 produce errorlogs
-  $0 produce auditlogs
-
-  # Produce 1000 messages to a specific topic
-  $0 produce apilogs -n 1000
-
-  # Query all Iceberg tables
+  # Query tables with PyIceberg
   $0 query
-
-  # Query a specific table
   $0 query apilogs
-  $0 query errorlogs
-  $0 query auditlogs
 
   # View logs
   $0 logs -f
@@ -176,10 +183,9 @@ start_services() {
 
     # Export for docker-compose
     export MINIO_LICENSE
-    export MINIO_TEST_IMAGE="${MINIO_TEST_IMAGE:-quay.io/minio/aistor/minio:log-targets}"
 
-    print_msg "$YELLOW" "Starting Kafka, Kafka Connect, and MinIO..."
-    docker compose up -d kafka minio
+    print_msg "$YELLOW" "Starting Kafka and MinIO clusters..."
+    docker compose up -d kafka nginx-source nginx-dest
 
     print_msg "$YELLOW" "Waiting for Kafka to be ready..."
     for i in {1..30}; do
@@ -190,17 +196,26 @@ start_services() {
         sleep 2
     done
 
-    print_msg "$YELLOW" "Waiting for MinIO to be ready..."
+    print_msg "$YELLOW" "Waiting for Source MinIO cluster to be ready..."
     for i in {1..30}; do
         if curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1; then
-            print_msg "$GREEN" "✓ MinIO is ready"
+            print_msg "$GREEN" "✓ Source MinIO cluster is ready"
             break
         fi
         sleep 2
     done
 
-    print_msg "$YELLOW" "Starting Kafka Connect..."
-    docker compose up -d kafka-connect
+    print_msg "$YELLOW" "Waiting for Destination MinIO cluster to be ready..."
+    for i in {1..30}; do
+        if curl -sf http://localhost:9010/minio/health/live >/dev/null 2>&1; then
+            print_msg "$GREEN" "✓ Destination MinIO cluster is ready"
+            break
+        fi
+        sleep 2
+    done
+
+    print_msg "$YELLOW" "Starting Kafka Connect and Trino..."
+    docker compose up -d kafka-connect trino
 
     print_msg "$YELLOW" "Waiting for Kafka Connect to be ready (this may take a minute)..."
     for i in {1..60}; do
@@ -220,13 +235,23 @@ start_services() {
     cat << 'EOF'
     ┌─────────────────────────────────────────────────────────────────┐
     │                    SERVICES READY                               │
+    │                 (Dual Cluster Architecture)                     │
     ├─────────────────────────────────────────────────────────────────┤
     │                                                                 │
-    │  Kafka:              localhost:9092                             │
-    │  Kafka Connect:      http://localhost:8083                      │
-    │  MinIO Console:      http://localhost:9001                      │
-    │                      (user: minioadmin / pass: minioadmin)      │
-    │  MinIO API:          http://localhost:9000                      │
+    │  Kafka:                  localhost:9092                         │
+    │  Kafka Connect:          http://localhost:8083                  │
+    │                                                                 │
+    │  Source MinIO (logs):                                           │
+    │    • Console:            http://localhost:9001                  │
+    │    • API:                http://localhost:9000                  │
+    │                                                                 │
+    │  Destination MinIO (Iceberg):                                   │
+    │    • Console:            http://localhost:9011                  │
+    │    • API:                http://localhost:9010                  │
+    │                                                                 │
+    │  Trino:                  http://localhost:9999                  │
+    │                                                                 │
+    │  Credentials:            minioadmin / minioadmin                │
     │                                                                 │
     │  Log Pipelines:                                                 │
     │    • apilogs   → streaming.apilogs   (API logs)                 │
@@ -237,12 +262,24 @@ start_services() {
 EOF
     echo -e "${NC}"
 
-    print_msg "$CYAN" "Quick commands:"
-    echo "  $0 produce   - Send test messages"
-    echo "  $0 status    - Check service status"
-    echo "  $0 logs -f   - View logs"
-    echo "  $0 query     - Query Iceberg table"
-    echo "  $0 stop      - Stop all services"
+    print_msg "$CYAN" "Quick start:"
+    echo "  # Generate API logs on source cluster"
+    echo "  $0 generate api --count 100"
+    echo ""
+    echo "  # Query logs in Trino"
+    echo "  docker exec -it trino trino --execute 'SELECT * FROM kafkawarehouse.streaming.apilogs LIMIT 10'"
+    echo ""
+    print_msg "$CYAN" "Generate logs with custom count:"
+    echo "  $0 generate api --count 500"
+    echo "  $0 generate error --count 100"
+    echo "  $0 generate audit --count 200"
+    echo ""
+    print_msg "$CYAN" "Other commands:"
+    echo "  $0 status              - Check service status"
+    echo "  $0 logs -f             - View logs"
+    echo "  $0 generate all        - Generate all log types"
+    echo "  $0 query               - Query Iceberg tables"
+    echo "  $0 stop                - Stop all services"
 }
 
 # Stop services
@@ -400,7 +437,7 @@ produce_messages() {
                 print_header "Producing $count messages to '$topic' topic"
                 for ((i=1; i<=count; i++)); do
                     generate_log_message "audit" "$i" | docker exec -i kafka kafka-console-producer --bootstrap-server localhost:29092 --topic "$topic"
-                    if [ $((i % 10)) -eq 0 ]; then
+                    if [ $((i % 10)) -eq 0 ]; then  
                         printf "\r${YELLOW}Progress: %d/%d messages${NC}" "$i" "$count"
                     fi
                 done
@@ -454,8 +491,8 @@ produce_messages() {
 
     echo ""
     print_msg "$CYAN" "The Iceberg sink commits every 10 seconds."
-    print_msg "$CYAN" "Check MinIO Console at http://localhost:9001 to see the data files."
-    print_msg "$CYAN" "Run '$0 query' to query the Iceberg tables."
+    print_msg "$CYAN" "Check Destination MinIO Console at http://localhost:9011 to see the data files."
+    print_msg "$CYAN" "Run '$0 query' to query the Iceberg tables with Trino."
 }
 
 # Query the Iceberg tables
@@ -494,18 +531,18 @@ from pyiceberg.catalog import load_catalog
 
 table_filter = os.getenv('TABLE_FILTER', '')
 
-print('Connecting to catalog...')
+print('Connecting to catalog on destination cluster...')
 try:
     catalog = load_catalog(
         'aistor',
         type='rest',
-        uri='http://minio:9000/_iceberg',
+        uri='http://nginx-dest:9000/_iceberg',
         warehouse='kafkawarehouse',
         **{
             'rest.sigv4-enabled': 'true',
             'rest.signing-name': 's3tables',
             'rest.signing-region': 'us-east-1',
-            's3.endpoint': 'http://minio:9000',
+            's3.endpoint': 'http://nginx-dest:9000',
             's3.access-key-id': 'minioadmin',
             's3.secret-access-key': 'minioadmin',
             's3.path-style-access': 'true',
@@ -566,16 +603,132 @@ try:
             print(f'Table not found or empty: {e}')
 
     print('\\n' + '='*70)
-    print('To generate logs, interact with MinIO:')
-    print('  docker exec minio mc mb local/testbucket')
-    print('  echo \"hello\" | docker exec -i minio mc pipe local/testbucket/test.txt')
+    print('To generate logs, interact with source MinIO cluster:')
+    print('  mc alias set source http://localhost:9000 minioadmin minioadmin')
+    print('  mc mb source/testbucket')
+    print('  mc cp /etc/hosts source/testbucket/')
     print('='*70)
 
 except Exception as e:
     print(f'Error: {e}')
-    print('\\nTables may not exist yet. Interact with MinIO to generate logs.')
+    print('\\nTables may not exist yet. Interact with source MinIO to generate logs.')
 PYEOF
         "
+}
+
+# Generate logs using the scripts in generate/ directory
+# These scripts interact with the source MinIO cluster to generate real logs
+generate_logs() {
+    local log_type="$1"
+    shift
+
+    # Default count
+    local count=100
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --count|-n)
+                count="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    # Check if mc is available
+    if ! command -v mc &> /dev/null; then
+        print_msg "$RED" "Error: mc (MinIO Client) is not installed."
+        print_msg "$YELLOW" "Please install mc: https://min.io/docs/minio/linux/reference/minio-mc.html"
+        exit 1
+    fi
+
+    # Generate unique alias name with UUID
+    local UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || echo "$$-$(date +%s)")
+    local ALIAS="source-${UUID:0:8}"
+
+    # Setup mc alias for source cluster with unique name
+    print_msg "$YELLOW" "Setting up temporary mc alias: $ALIAS"
+    mc alias set "$ALIAS" http://localhost:9000 minioadmin minioadmin > /dev/null 2>&1
+
+    # Cleanup function to remove alias
+    cleanup_alias() {
+        print_msg "$YELLOW" "Cleaning up temporary alias: $ALIAS"
+        mc alias rm "$ALIAS" > /dev/null 2>&1 || true
+    }
+
+    # Trap to ensure cleanup on exit (including Ctrl+C)
+    trap cleanup_alias EXIT INT TERM
+
+    case "$log_type" in
+        api|api-logs)
+            print_header "Generating API Logs on Source Cluster"
+            print_msg "$CYAN" "This will generate $count API operations on the source MinIO cluster."
+            print_msg "$CYAN" "Logs will flow: Source MinIO → Kafka (apilogs) → Iceberg → Dest MinIO"
+            echo ""
+            "$SCRIPT_DIR/generate/generate-api-logs.sh" "$ALIAS" --count "$count"
+            ;;
+        error|error-logs)
+            print_header "Generating Error Logs on Source Cluster"
+            print_msg "$CYAN" "This will generate $count error-triggering operations on source MinIO."
+            print_msg "$CYAN" "Logs will flow: Source MinIO → Kafka (errorlogs) → Iceberg → Dest MinIO"
+            echo ""
+            "$SCRIPT_DIR/generate/generate-error-logs.sh" "$ALIAS" --count "$count"
+            ;;
+        audit|audit-logs)
+            print_header "Generating Audit Logs on Source Cluster"
+            print_msg "$CYAN" "This will generate $count audit-triggering operations on source MinIO."
+            print_msg "$CYAN" "Logs will flow: Source MinIO → Kafka (auditlogs) → Iceberg → Dest MinIO"
+            echo ""
+            "$SCRIPT_DIR/generate/generate-audit-logs.sh" "$ALIAS" --count "$count"
+            ;;
+        all)
+            print_header "Generating All Log Types on Source Cluster"
+            print_msg "$CYAN" "This will generate $count operations for each log type."
+            echo ""
+
+            print_msg "$YELLOW" "=== API Logs ==="
+            "$SCRIPT_DIR/generate/generate-api-logs.sh" "$ALIAS" --count "$count"
+            echo ""
+
+            print_msg "$YELLOW" "=== Error Logs ==="
+            "$SCRIPT_DIR/generate/generate-error-logs.sh" "$ALIAS" --count "$count"
+            echo ""
+
+            print_msg "$YELLOW" "=== Audit Logs ==="
+            "$SCRIPT_DIR/generate/generate-audit-logs.sh" "$ALIAS" --count "$count"
+            ;;
+        *)
+            print_msg "$RED" "Unknown log type: $log_type"
+            echo ""
+            echo "Usage: $0 generate <type> [--count N]"
+            echo ""
+            echo "Log types:"
+            echo "  api         Generate API logs (S3 operations)"
+            echo "  error       Generate error logs (error-triggering operations)"
+            echo "  audit       Generate audit logs (admin/IAM operations)"
+            echo "  all         Generate all log types"
+            echo ""
+            echo "Options:"
+            echo "  --count N   Number of operations to generate (default: 100)"
+            echo ""
+            echo "Examples:"
+            echo "  $0 generate api"
+            echo "  $0 generate error --count 500"
+            echo "  $0 generate audit --count 200"
+            echo "  $0 generate all --count 50"
+            exit 1
+            ;;
+    esac
+
+    echo ""
+    print_msg "$GREEN" "✓ Log generation complete!"
+    print_msg "$CYAN" "Check the Kafka topics and Iceberg tables:"
+    echo "  - View Kafka topics: docker exec kafka kafka-console-consumer --bootstrap-server localhost:29092 --topic apilogs --from-beginning"
+    echo "  - Query with Trino:  docker exec -it trino trino"
+    echo "  - Check Dest MinIO:  http://localhost:9011 → kafkawarehouse/streaming/"
 }
 
 # Restart services
@@ -609,6 +762,10 @@ main() {
         query)
             shift
             query_table "$1"
+            ;;
+        generate)
+            shift
+            generate_logs "$@"
             ;;
         restart)
             restart_services
