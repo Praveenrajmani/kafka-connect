@@ -64,6 +64,7 @@ COMMANDS:
   status          Show status of all services
   logs            Show logs (use -f for follow)
   generate <type> Generate logs on source cluster (api|error|audit|all)
+  continuous      Generate logs continuously (Ctrl+C to stop)
   query [table]   Query Iceberg table(s) with PyIceberg
   restart         Restart all services
   clean           Stop and remove all data
@@ -98,6 +99,10 @@ EXAMPLES:
   $0 generate error            # Generate error logs
   $0 generate audit            # Generate audit logs
   $0 generate all --count 50   # Generate all log types (50 each)
+
+  # Continuous log generation (Ctrl+C to stop)
+  $0 continuous                     # Default: 2s interval, 5 ops/batch
+  $0 continuous -i 5 -b 10          # 5s interval, 10 ops per batch
 
   # Query Iceberg tables with Trino
   docker exec -it trino trino
@@ -731,6 +736,100 @@ generate_logs() {
     echo "  - Check Dest MinIO:  http://localhost:9011 → kafkawarehouse/streaming/"
 }
 
+# Generate logs continuously until Ctrl+C
+# Usage: generate_logs_continuous [--interval SECONDS] [--batch SIZE]
+generate_logs_continuous() {
+    local interval=2
+    local batch_size=5
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval|-i)
+                interval="$2"
+                shift 2
+                ;;
+            --batch|-b)
+                batch_size="$2"
+                shift 2
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    print_header "Continuous Log Generation Mode"
+
+    # Load config to get port settings
+    if [ -f "${PROJECT_ROOT}/.env" ]; then
+        set -a
+        source "${PROJECT_ROOT}/.env"
+        set +a
+    fi
+
+    local source_api_port="${SOURCE_API_PORT:-9000}"
+
+    if ! curl -sf "http://localhost:${source_api_port}/minio/health/live" >/dev/null 2>&1; then
+        print_msg "$RED" "Error: Source MinIO is not running on port ${source_api_port}"
+        exit 1
+    fi
+
+    print_msg "$YELLOW" "Generating logs continuously..."
+    print_msg "$CYAN" "  Interval: ${interval}s between batches"
+    print_msg "$CYAN" "  Batch size: ${batch_size} operations per batch"
+    print_msg "$CYAN" ""
+    print_msg "$GREEN" "Press Ctrl+C to stop"
+    print_msg "$CYAN" ""
+
+    # Trap Ctrl+C
+    trap 'echo ""; print_msg "$YELLOW" "Stopping continuous log generation..."; exit 0' INT TERM
+
+    local iteration=0
+    local total_ops=0
+
+    # Create test bucket once
+    docker run --rm --network kafka-connect_kafka-iceberg \
+        -e MC_HOST_source=http://minioadmin:minioadmin@nginx-source:9000 \
+        minio/mc:latest mc mb source/continuous-logs-bucket --ignore-existing 2>/dev/null
+
+    while true; do
+        iteration=$((iteration + 1))
+        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+        # Run batch of operations
+        docker run --rm --network kafka-connect_kafka-iceberg \
+            -e MC_HOST_source=http://minioadmin:minioadmin@nginx-source:9000 \
+            minio/mc:latest bash -c "
+            for i in \$(seq 1 ${batch_size}); do
+                # Mix of operations: put, get, list, stat
+                op=\$((RANDOM % 4))
+                obj_id=\"obj-\${RANDOM}\"
+
+                case \$op in
+                    0) # PUT
+                        echo \"data-\$(date +%s)-\$i\" | mc pipe source/continuous-logs-bucket/\${obj_id}.txt 2>/dev/null
+                        ;;
+                    1) # GET (may fail if object doesn't exist, that's fine)
+                        mc cat source/continuous-logs-bucket/\${obj_id}.txt 2>/dev/null || true
+                        ;;
+                    2) # LIST
+                        mc ls source/continuous-logs-bucket/ >/dev/null 2>&1
+                        ;;
+                    3) # STAT
+                        mc stat source/continuous-logs-bucket/\${obj_id}.txt 2>/dev/null || true
+                        ;;
+                esac
+            done
+            " 2>/dev/null
+
+        total_ops=$((total_ops + batch_size))
+        printf "\r${CYAN}[%s] Iteration: %d | Total operations: %d${NC}" "$timestamp" "$iteration" "$total_ops"
+
+        sleep "$interval"
+    done
+}
+
 # Restart services
 restart_services() {
     stop_services
@@ -766,6 +865,10 @@ main() {
         generate)
             shift
             generate_logs "$@"
+            ;;
+        continuous)
+            shift
+            generate_logs_continuous "$@"
             ;;
         restart)
             restart_services
